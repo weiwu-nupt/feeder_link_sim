@@ -10,6 +10,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QFont
 from ui.main_window import MainWindow
 
 
@@ -17,6 +18,11 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("馈电链路仿真平台")
     app.setApplicationVersion("0.1.0")
+
+    # 设置全局默认字体，避免 QFont point size <= 0 警告
+    font = QFont()
+    font.setPointSize(10)
+    app.setFont(font)
 
     window = MainWindow()
     window.show()
