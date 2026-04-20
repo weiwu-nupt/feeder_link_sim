@@ -216,7 +216,7 @@ class _EditDelegate(QStyledItemDelegate):
             "QLineEdit{"
             "  background:#FFFFFF; color:#111111;"
             "  border:2px solid #2E6DB4; border-radius:2px;"
-            "  padding:1px 4px; font-size:12px;"
+            "  padding:1px 4px; font-size: 9pt;"
             "  selection-background-color:#BEDAF7;"
             "}")
         return ed
@@ -278,13 +278,13 @@ class LinkBudgetDialog(ModuleDialog):
         self.table.setStyleSheet(f"""
             QTableWidget {{
                 background:#FFFFFF; border:1px solid #C8D8EC;
-                gridline-color:#D8E4F0; font-size:12px; color:#1A1A1A;
+                gridline-color:#D8E4F0; font-size: 9pt; color:#1A1A1A;
             }}
             QTableWidget::item {{ padding:2px 5px; }}
             QTableWidget::item:selected {{ background:#C5DCF5; color:#1A1A1A; }}
             QHeaderView::section {{
                 background:{C_HDR_BG}; color:#FFFFFF;
-                font-size:12px; font-weight:600;
+                font-size: 9pt; font-weight:600;
                 padding:4px 5px; border:none;
                 border-right:1px solid #4A88C7;
                 border-bottom:1px solid #4A88C7;
@@ -563,5 +563,5 @@ class LinkBudgetDialog(ModuleDialog):
         from PyQt6.QtGui import QColor as QC
         dark = QC(color).darker(130).name()
         return (f"QPushButton{{background:{color};color:#FFF;border:none;"
-                f"border-radius:4px;padding:0 12px;font-size:12px;}}"
+                f"border-radius:4px;padding:0 12px;font-size: 9pt;}}"
                 f"QPushButton:hover{{background:{dark};}}")

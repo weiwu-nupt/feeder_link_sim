@@ -5,7 +5,8 @@ Module Dialogs — Stubs for future implementation
 
 from ui.base_dialog import ModuleDialog
 from modules.Link_budget import LinkBudgetDialog
-from modules.pa_mode import PAModelDialog
+from modules.pa_mode import PAModelDialog 
+from modules.ber_analysis import BERAnalysisDialog  
 
 
 # ── 无线信道建模 ───────────────────────────────────────────

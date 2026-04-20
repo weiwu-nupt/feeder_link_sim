@@ -11,7 +11,7 @@ from ui.styles import APP_STYLE
 from ui.dialogs import (
     LinkBudgetDialog, ChannelModelDialog,
     PAModelDialog, ADDAModelDialog, FilterModelDialog, MixerModelDialog,
-    SingleLinkSimDialog, MultiLinkSimDialog,
+    SingleLinkSimDialog, MultiLinkSimDialog, BERAnalysisDialog,
 )
 
 
@@ -48,7 +48,9 @@ class MainWindow(QMainWindow):
         btn_style = """
             QToolButton {
                 background: transparent; border: none;
-                padding: 5px 14px; font-size: 13px; color: #5F5E5A;
+                padding: 5px 14px;
+                font-family: "Microsoft YaHei", "SimHei", "Arial", sans-serif;
+                font-size: 10pt; color: #5F5E5A;
                 border-radius: 4px;
             }
             QToolButton:hover   { background: #F1EFE8; color: #2C2C2A; }
@@ -70,7 +72,7 @@ class MainWindow(QMainWindow):
             QMenu {
                 background:#FFFFFF; border:1px solid #D3D1C7;
                 border-radius:6px; padding:4px;
-                font-size:13px; color:#2C2C2A;
+                font-size: 10pt; color:#2C2C2A;
             }
             QMenu::item { padding:6px 20px 6px 12px; border-radius:4px; }
             QMenu::item:selected { background:#F1EFE8; }
@@ -93,7 +95,11 @@ class MainWindow(QMainWindow):
         dev_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         tb.addWidget(dev_btn)
 
-        # ④ 单链路仿真
+        # ④ 误码率分析
+        self._plain_btn(tb, "误码率分析", btn_style,
+                        lambda: self._open("ber", BERAnalysisDialog))
+
+        # ⑤ 单链路仿真
         self._plain_btn(tb, "单链路仿真", btn_style,
                         lambda: self._open("single", SingleLinkSimDialog))
 
@@ -126,16 +132,16 @@ class MainWindow(QMainWindow):
         ilay = QVBoxLayout(icon_frame)
         ilay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ilay.addWidget(QLabel("◎",
-            styleSheet="font-size:26px;color:#7F77DD;background:transparent;"))
+            styleSheet="font-size: 20pt;color:#7F77DD;background:transparent;"))
 
         title = QLabel("馈电链路仿真平台")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-size:18px;font-weight:500;color:#444441;")
+        title.setStyleSheet("font-size: 14pt;font-weight:500;color:#444441;")
 
         subtitle = QLabel("从上方菜单选择模块开始仿真\n"
                           "链路预算 · 信道建模 · 器件建模 · 单/多链路仿真")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet("font-size:13px;color:#888780;")
+        subtitle.setStyleSheet("font-size: 10pt;color:#888780;")
 
         layout.addStretch()
         layout.addWidget(icon_frame, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -151,14 +157,14 @@ class MainWindow(QMainWindow):
         sb = self.statusBar()
         sb.setFixedHeight(28)
         ready = QLabel("●  就绪")
-        ready.setStyleSheet("color:#1D9E75;font-size:11px;padding:0 8px;")
+        ready.setStyleSheet("color:#1D9E75;font-size: 8pt;padding:0 8px;")
         sb.addWidget(ready)
         sb.addWidget(self._vsep())
         sb.addWidget(QLabel("频段: —",
-            styleSheet="color:#888780;font-size:11px;"))
+            styleSheet="color:#888780;font-size: 8pt;"))
         sb.addWidget(self._vsep())
         sb.addWidget(QLabel("链路数: 0",
-            styleSheet="color:#888780;font-size:11px;"))
+            styleSheet="color:#888780;font-size: 8pt;"))
         sb.addPermanentWidget(QLabel("馈电链路仿真平台  v0.1.0  "))
 
     @staticmethod

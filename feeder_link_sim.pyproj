@@ -22,6 +22,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="main.py" />
+    <Compile Include="modules\ber_analysis.py" />
     <Compile Include="modules\link_budget.py" />
     <Compile Include="modules\pa_mode.py" />
     <Compile Include="ui\base_dialog.py" />

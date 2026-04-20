@@ -13,7 +13,7 @@ QMenuBar {
     background-color: #FFFFFF;
     border-bottom: 1px solid #E8E8E5;
     padding: 2px 8px;
-    font-size: 13px;
+    font-size: 10pt;
     color: #444441;
     spacing: 2px;
 }
@@ -38,7 +38,7 @@ QMenu {
     border: 1px solid #D3D1C7;
     border-radius: 8px;
     padding: 6px;
-    font-size: 13px;
+    font-size: 10pt;
     color: #444441;
 }
 QMenu::item {
@@ -60,7 +60,7 @@ QMenu::separator {
 QStatusBar {
     background-color: #FFFFFF;
     border-top: 1px solid #E8E8E5;
-    font-size: 11px;
+    font-size: 8pt;
     color: #888780;
     padding: 0 8px;
 }
@@ -77,7 +77,7 @@ QDialog {
 /* ── 标签 ── */
 QLabel {
     color: #444441;
-    font-size: 13px;
+    font-size: 10pt;
 }
 
 /* ── 输入框 ── */
@@ -86,7 +86,7 @@ QLineEdit {
     border: 1px solid #D3D1C7;
     border-radius: 6px;
     padding: 6px 10px;
-    font-size: 13px;
+    font-size: 10pt;
     color: #2C2C2A;
     selection-background-color: #B5D4F4;
 }
@@ -104,7 +104,7 @@ QPushButton {
     border: 1px solid #D3D1C7;
     border-radius: 6px;
     padding: 7px 16px;
-    font-size: 13px;
+    font-size: 10pt;
     color: #444441;
 }
 QPushButton:hover {
@@ -131,7 +131,7 @@ QGroupBox {
     border-radius: 8px;
     margin-top: 12px;
     padding: 12px;
-    font-size: 13px;
+    font-size: 10pt;
     font-weight: 500;
     color: #444441;
 }
@@ -141,7 +141,7 @@ QGroupBox::title {
     padding: 0 8px;
     left: 12px;
     color: #5F5E5A;
-    font-size: 12px;
+    font-size: 9pt;
     font-weight: 500;
 }
 
@@ -151,7 +151,7 @@ QComboBox {
     border: 1px solid #D3D1C7;
     border-radius: 6px;
     padding: 6px 10px;
-    font-size: 13px;
+    font-size: 10pt;
     color: #2C2C2A;
     min-width: 120px;
 }
@@ -177,7 +177,7 @@ QTableWidget {
     border: 1px solid #E8E8E5;
     border-radius: 6px;
     gridline-color: #F1EFE8;
-    font-size: 13px;
+    font-size: 10pt;
     color: #2C2C2A;
 }
 QTableWidget::item {
@@ -193,7 +193,7 @@ QHeaderView::section {
     border-bottom: 1px solid #E8E8E5;
     border-right: 1px solid #E8E8E5;
     padding: 6px 10px;
-    font-size: 12px;
+    font-size: 9pt;
     font-weight: 500;
     color: #5F5E5A;
 }
@@ -242,7 +242,7 @@ QTabBar::tab {
     background-color: transparent;
     border: none;
     padding: 8px 16px;
-    font-size: 13px;
+    font-size: 10pt;
     color: #888780;
     border-bottom: 2px solid transparent;
 }

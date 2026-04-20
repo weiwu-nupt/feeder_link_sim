@@ -56,7 +56,7 @@ class ModuleDialog(QDialog):
         icon = QLabel("⚙")
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon.setStyleSheet(
-            f"font-size:28px;color:{self.ACCENT_COLOR};"
+            f"font-size: 21pt;color:{self.ACCENT_COLOR};"
             f"background:{self._lighten(self.ACCENT_COLOR)};"
             "border-radius:14px;padding:14px;")
         icon.setFixedSize(60, 60)
@@ -66,11 +66,11 @@ class ModuleDialog(QDialog):
         phl.addSpacing(8)
         lbl = QLabel(f"{self.TITLE} — 开发中")
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet("font-size:15px;font-weight:500;color:#5F5E5A;")
+        lbl.setStyleSheet("font-size: 11pt;font-weight:500;color:#5F5E5A;")
         phl.addWidget(lbl)
         desc = QLabel("该模块正在建设中，敬请期待。")
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet("font-size:13px;color:#888780;")
+        desc.setStyleSheet("font-size: 10pt;color:#888780;")
         phl.addWidget(desc)
         phl.addStretch()
         layout.addWidget(ph)
