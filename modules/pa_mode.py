@@ -1,13 +1,27 @@
 """
-功放模型 — Power Amplifier Model
-无记忆: Saleh, Modified Rapp
-有记忆: Memory Polynomial (MP), Cross-Term Memory (CTM)
-参考:
-  - MathWorks RF Blockset Power Amplifier block
-  - Morgan et al., IEEE Trans. SP, Vol.54, Oct.2006 (eq.19, eq.23)
+功放表征模块 — Power Amplifier Characterization
+================================================
+按 MathWorks PowerAmplifierCharacterizationExample 流程实现：
+
+  1. 从 .mat 文件读取功放实测数据
+       helperPACharSavedData<BW>MHz.mat
+       results.InputWaveform / OutputWaveform / ReferencePower / MeasuredAMToAM
+  2. 生成 5G-like OFDM 测试波形 (helperPACharGenerateOFDM)
+  3. 由实测数据绘制 AM/AM 与 Gain vs Input Power 曲线
+  4. 用记忆多项式模型仿真功放，模型可选：
+       MP  — Memory Polynomial          (memPoly)
+       CM  — Cross-Term Memory Polynomial (ctMemPoly)
+     记忆长度 memLen 与多项式阶数 degLen 可调
+  5. 求得拟合系数矩阵 fitCoefMatMem，可导出
+  6. 绘制 helperPACharPlotGain：实测 vs 拟合 增益对比
+
+参考：
+  - PowerAmplifierCharacterizationExample, The MathWorks Inc.
+  - helperPACharMemPolyModel.m
+  - IEEE Std 802.11a-1999, Eq.28 (RMS EVM)
 """
 
-import math
+import os
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -20,7 +34,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QPushButton, QComboBox,
     QGroupBox, QSplitter, QFileDialog,
-    QMessageBox, QSizePolicy,
+    QMessageBox, QSizePolicy, QPlainTextEdit,
 )
 from PyQt6.QtCore import Qt
 
@@ -29,7 +43,7 @@ from ui.base_dialog import ModuleDialog
 
 # ── 字体 ──────────────────────────────────────────────────
 def _setup_font():
-    for n in ["Microsoft YaHei","SimHei","PingFang SC","Noto Sans CJK SC"]:
+    for n in ["Microsoft YaHei", "SimHei", "PingFang SC", "Noto Sans CJK SC"]:
         if n in {f.name for f in fm.fontManager.ttflist}:
             plt.rcParams["font.family"] = n
             plt.rcParams["axes.unicode_minus"] = False
@@ -38,252 +52,249 @@ _setup_font()
 
 
 # ══════════════════════════════════════════════════════════
-#  单位约定（与 MathWorks RF Blockset 一致）
-#  r = sqrt(P_W) = sqrt(1e-3 * 10^(Pin_dBm/10))
-#  Pout_dBm = 10·log10(r_out² / 1e-3)
+#  1. OFDM 测试波形生成  (helperPACharGenerateOFDM)
 # ══════════════════════════════════════════════════════════
 
-def _dbm2r(p: float) -> float:
-    return math.sqrt(1e-3 * 10 ** (p / 10.0))
-
-def _r2dbm(r: float) -> float:
-    return 10 * math.log10(r ** 2 / 1e-3 + 1e-30)
-
-def _dbm2r_arr(p: np.ndarray) -> np.ndarray:
-    return np.sqrt(1e-3 * 10 ** (p / 10.0))
-
-def _r2dbm_arr(r: np.ndarray) -> np.ndarray:
-    return 10 * np.log10(r ** 2 / 1e-3 + 1e-30)
+# bw -> (scs, fftLength, NSubcarriers, cpLength, windowLength)
+_OFDM_PARAMS = {
+    5e6:   (30e3,  256,  132,  18,  6),
+    15e6:  (30e3, 1024,  456,  72,  6),
+    40e6:  (30e3, 2048, 1272, 144,  8),
+    100e6: (30e3, 4096, 3276, 288, 20),
+}
 
 
-# ══════════════════════════════════════════════════════════
-#  无记忆模型
-# ══════════════════════════════════════════════════════════
-
-def saleh_amam(r, alpha_a, beta_a):
-    """F(r) = alpha_a·r / (1 + beta_a·r²)"""
-    return alpha_a * r / (1.0 + beta_a * r ** 2)
-
-def saleh_ampm(r, alpha_p, beta_p):
-    """Φ(r) = alpha_p·r² / (1 + beta_p·r²)  → degrees"""
-    return np.degrees(alpha_p * r ** 2 / (1.0 + beta_p * r ** 2))
-
-def rapp_amam(r, g_lin, v_sat, p):
-    """F(r) = g·r / (1 + (g·r/Vsat)^{2p})^{1/(2p)}"""
-    x = (g_lin * r / v_sat) ** (2.0 * p)
-    return g_lin * r / (1.0 + x) ** (1.0 / (2.0 * p))
-
-def rapp_ampm(r, A, B, q1, q2):
+def generate_ofdm(bw: float):
     """
-    Φ(r) = A·r^q1 / (1 + (r/B)^q2)  → degrees
-    极限(q1=q2): A·B^q2
+    生成 5G-like 64-QAM OFDM 复基带波形。
+
+    返回 (txWaveform, sampleRate, numFrames)
+      txWaveform : 1-D complex ndarray（已归一化，峰值=1）
+      sampleRate : 采样率 (Hz)
+      numFrames  : 帧数
+
+    说明：matplotlib/numpy 无 comm.OFDMModulator，此处用 IFFT 直接
+    实现等效的加保护带 + 循环前缀 + 过采样 OFDM 调制。
     """
-    return np.degrees(A * r ** q1 / (1.0 + (r / B) ** q2))
+    if bw not in _OFDM_PARAMS:
+        raise ValueError(f"不支持的带宽 {bw/1e6} MHz，可选 5/15/40/100 MHz")
 
+    scs, fftLength, NSub, cpLength, _win = _OFDM_PARAMS[bw]
+    M = 64                       # 64-QAM
+    osr = 7                      # 过采样率
+    numFrames = 30
+    sampleRate = scs * fftLength * osr
+    nGuard = fftLength - NSub    # 保护带子载波总数
 
-# ══════════════════════════════════════════════════════════
-#  有记忆模型（Morgan et al., IEEE Trans. SP, Vol.54, 2006）
-#
-#  系数矩阵约定（与 MathWorks Power Amplifier block 一致）:
-#
-#  MP  (eq.19): C shape = (M, D)
-#    y(n) = Σ_{m=0}^{M-1} Σ_{d=0}^{D-1} C[m,d] · x(n-m) · |x(n-m)|^d
-#    M=记忆深度(Memory Depth), D=电压阶次(Voltage Order)
-#    d=0: 线性; d=1: 三阶; d=2: 五阶 ...
-#
-#  CTM (eq.23 简化): C shape = (M, M*(D-1)+1)
-#    y(n) = C .* M_CTM 所有元素之和
-#    M_CTM[m, 0]      = x(n-m)                    (d=0, 线性列)
-#    M_CTM[m, d*M+l'] = x(n-m) · |x(n-(M-1-l'))|^d  (d>=1, l'=0..M-1)
-#    参见 fit_memory_poly_model 的 ctMemPoly case
-# ══════════════════════════════════════════════════════════
+    # 64-QAM 星座（Gray 映射，平均功率归一化）
+    k = int(np.sqrt(M))          # 8
+    lvl = np.arange(-(k - 1), k, 2)
+    I, Q = np.meshgrid(lvl, lvl)
+    const = (I.ravel() + 1j * Q.ravel())
+    const = const / np.sqrt(np.mean(np.abs(const) ** 2))
 
-def _apply_mp(x: np.ndarray, C: np.ndarray) -> np.ndarray:
-    """
-    Memory Polynomial (eq.19):
-    y(n) = Σ_{m=0}^{M-1} Σ_{d=0}^{D-1} C[m,d] · x(n-m) · |x(n-m)|^d
-    C: (M, D) complex
-    """
-    M, D = C.shape
-    N = len(x)
-    y = np.zeros(N, dtype=complex)
-    for n in range(M - 1, N):
-        for m in range(M):
-            xm = x[n - m]
-            em = abs(xm)
-            for d in range(D):
-                y[n] += C[m, d] * xm * em ** d
-    return y
+    rng = np.random.RandomState(12345)         # 可复现
+    nDataSc = fftLength - nGuard - 1           # 每帧数据子载波数
 
-
-def _apply_ctm(x: np.ndarray, C: np.ndarray) -> np.ndarray:
-    """
-    Cross-Term Memory，严格按 fit_memory_poly_model ctMemPoly 列顺序:
-    C shape: (M, M*(D-1)+1)
-
-    列排列（与 MATLAB 代码一致）:
-      col=0:    x(t-m)                               [线性]
-      col=j+1 (j=0..M*(D-1)-1):
-        l = M-1-(j%M),   d = j//M+1
-        基函数: x(t-m) * |x(t-l)|^d                [交叉包络项]
-
-    等价展开 (M=3, D=3, ncols=7):
-      col=1: d=1,l=2  col=2: d=1,l=1  col=3: d=1,l=0
-      col=4: d=2,l=2  col=5: d=2,l=1  col=6: d=2,l=0
-    """
-    M = C.shape[0]
-    ncols = C.shape[1]           # M*(D-1)+1
-    D = (ncols - 1) // M + 1    # Voltage Order
-    N = len(x)
-    y = np.zeros(N, dtype=complex)
-    for n in range(M - 1, N):
-        for m in range(M):
-            xm = x[n - m]
-            # col=0: 线性
-            y[n] += C[m, 0] * xm
-            # col=j+1: 交叉包络项
-            for j in range(M * (D - 1)):
-                l = M - 1 - (j % M)    # 包络延迟
-                d = j // M + 1          # 包络幂次
-                if n - l >= 0:
-                    y[n] += C[m, j + 1] * xm * abs(x[n - l]) ** d
-    return y
-
-
-def _gen_ofdm(n_sc=64, n_sym=60, cp=0.25, seed=42):
-    """生成归一化 QPSK-OFDM 复基带信号（峰值=1）"""
-    rng = np.random.default_rng(seed)
-    qpsk = np.exp(1j * (np.pi/4 + rng.integers(0, 4, (n_sym, n_sc)) * np.pi/2))
-    cp_len = int(n_sc * cp)
+    # 保护带与 DC 置零的子载波映射
+    g_lo = nGuard // 2 + 1
+    g_hi = nGuard // 2
     frames = []
-    for sym in qpsk:
-        td = np.fft.ifft(sym) * np.sqrt(n_sc)
-        frames.append(np.concatenate([td[-cp_len:], td]))
-    x = np.concatenate(frames)
-    pk = np.max(np.abs(x))
-    return x / pk if pk > 0 else x
+    for _ in range(numFrames):
+        idx = rng.randint(0, M, nDataSc)
+        sym = const[idx]
+        grid = np.zeros(fftLength, dtype=complex)
+        # 数据子载波放在 [g_lo, g_lo+half) 与 (DC) 两侧
+        half = nDataSc // 2
+        grid[g_lo:g_lo + half] = sym[:half]
+        grid[g_lo + half + 1:g_lo + half + 1 + (nDataSc - half)] = sym[half:]
+        td = np.fft.ifft(np.fft.ifftshift(grid)) * np.sqrt(fftLength)
+        td = np.concatenate([td[-cpLength:], td])          # 加循环前缀
+        td = _resample(td, osr)                            # 过采样
+        frames.append(td)
+
+    txWaveform = np.concatenate(frames)
+    pk = np.max(np.abs(txWaveform))
+    if pk > 0:
+        txWaveform = txWaveform / pk
+    return txWaveform, sampleRate, numFrames
 
 
-def _extract_amam_ampm(x_in, y_out, n_bins=40, skip=0):
+def _resample(x: np.ndarray, factor: int) -> np.ndarray:
+    """整数倍频域过采样（zero-padding interpolation）。"""
+    n = len(x)
+    X = np.fft.fft(x)
+    Xup = np.zeros(n * factor, dtype=complex)
+    h = n // 2
+    Xup[:h] = X[:h]
+    Xup[-h:] = X[-h:]
+    return np.fft.ifft(Xup) * factor
+
+
+# ══════════════════════════════════════════════════════════
+#  读取功放实测数据  (load helperPACharSavedData<BW>MHz.mat)
+# ══════════════════════════════════════════════════════════
+
+class PAData:
+    """功放实测数据容器。"""
+    __slots__ = ("input_wave", "output_wave", "reference_power",
+                 "measured_amam", "linear_gain", "sample_rate",
+                 "oversampling_rate", "num_frames", "bw")
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw.get(k))
+
+
+def load_pa_data(mat_path: str) -> PAData:
     """
-    从输入/输出复基带信号按幅度分bin，
-    提取平均 AM/AM（输入幅度 vs 输出幅度）和 AM/PM（输入幅度 vs 相位偏移）
-    返回 (amp_in_bins, amp_out_mean, phase_mean_deg)
+    读取 MATLAB 保存的功放表征数据文件。
+    对应 MATLAB: load(dataFileName, "results", "sampleRate", ...)
     """
-    xi = x_in[skip:];  yi = y_out[skip:]
-    mask = np.abs(xi) > 1e-8
-    xi, yi = xi[mask], yi[mask]
-    amp_in  = np.abs(xi)
-    amp_out = np.abs(yi)
-    phi_deg = np.angle(yi / (xi + 1e-15), deg=True)
-    edges = np.linspace(amp_in.min(), amp_in.max(), n_bins + 1)
-    centers, out_m, phi_m = [], [], []
-    for i in range(n_bins):
-        m = (amp_in >= edges[i]) & (amp_in < edges[i+1])
-        if m.sum() >= 3:
-            centers.append((edges[i] + edges[i+1]) / 2)
-            out_m.append(np.mean(amp_out[m]))
-            phi_m.append(np.mean(phi_deg[m]))
-    return np.array(centers), np.array(out_m), np.array(phi_m)
+    import scipy.io as sio
+    m = sio.loadmat(mat_path)
+    if "results" not in m:
+        raise ValueError("文件中缺少 results 结构体，"
+                          "请选择 helperPACharSavedData*MHz.mat 文件")
+    r = m["results"][0, 0]
+
+    def fld(name):
+        return r[name].ravel() if name in r.dtype.names else None
+
+    sr = m["sampleRate"].item() if "sampleRate" in m else None
+    osr = int(m["overSamplingRate"].item()) if "overSamplingRate" in m else None
+    nf = int(m["numFrames"].item()) if "numFrames" in m else None
+
+    # 从文件名推断带宽
+    bw = None
+    base = os.path.basename(mat_path)
+    import re
+    mt = re.search(r"(\d+)MHz", base)
+    if mt:
+        bw = float(mt.group(1)) * 1e6
+
+    return PAData(
+        input_wave=np.asarray(fld("InputWaveform"), dtype=np.complex128),
+        output_wave=np.asarray(fld("OutputWaveform"), dtype=np.complex128),
+        reference_power=np.asarray(fld("ReferencePower"), dtype=np.float64),
+        measured_amam=np.asarray(fld("MeasuredAMToAM"), dtype=np.float64),
+        linear_gain=float(r["LinearGain"].item())
+        if "LinearGain" in r.dtype.names else None,
+        sample_rate=sr, oversampling_rate=osr, num_frames=nf, bw=bw,
+    )
 
 
-def _mem_sweep(pin_arr, C, mode, in_sc_db=0, out_sc_db=0, n_sym=60):
+# ══════════════════════════════════════════════════════════
+#  记忆多项式模型  (helperPACharMemPolyModel)
+#  modType: 'memPoly'  → MP   (Memory Polynomial)
+#           'ctMemPoly'→ CM   (Cross-Term Memory Polynomial)
+# ══════════════════════════════════════════════════════════
+
+def mp_coefficient_finder(x, y, memLen, degLen, modType):
     """
-    用 OFDM 信号驱动有记忆模型，返回 (pout_dbm, phase_deg) 插值到 pin_arr。
-    pin_arr 中值作为 OFDM 信号的 RMS 功率参考。
+    coefficientFinder：由输入/输出信号最小二乘求解系数矩阵。
+
+    返回 coefMat
+      MP : 形状 (memLen, degLen)
+      CM : 形状 (memLen, memLen*(degLen-1)+1)
+
+    严格对应 MATLAB helperPACharMemPolyModel 'coefficientFinder' 分支。
     """
-    p_ref_dbm = float(np.median(pin_arr))
-    p_ref_w   = 1e-3 * 10 ** (p_ref_dbm / 10.0)
+    x = np.asarray(x).ravel()
+    y = np.asarray(y).ravel()
+    xLen = len(x)
 
-    # 生成并缩放 OFDM
-    x_norm = _gen_ofdm(n_sc=64, n_sym=n_sym)
-    rms_x  = np.sqrt(np.mean(np.abs(x_norm) ** 2))
-    x_sig  = x_norm * (np.sqrt(p_ref_w) / (rms_x + 1e-15))
+    if modType == "memPoly":
+        # xrow = reshape((memLen:-1:1)' + (0:xLen:xLen*(degLen-1)), 1, [])
+        a = np.arange(memLen, 0, -1).reshape(-1, 1)
+        b = np.arange(0, xLen * degLen, xLen).reshape(1, -1)
+        xrow = (a + b).reshape(1, -1, order="F")
+        rows = np.arange(0, xLen - memLen + 1).reshape(-1, 1)
+        xVecIdx = rows + xrow
+        # xPow = x .* (abs(x).^(0:degLen-1))
+        xPow = x.reshape(-1, 1) * (np.abs(x).reshape(-1, 1) ** np.arange(degLen))
+        xVec = xPow.flatten(order="F")[xVecIdx - 1]
 
-    if in_sc_db != 0:
-        x_sig = x_sig * 10 ** (in_sc_db / 20.0)
-
-    # 运行模型
-    if mode == 'MP':
-        y_sig = _apply_mp(x_sig, C)
-    elif mode == 'CTM':
-        y_sig = _apply_ctm(x_sig, C)
+    elif modType == "ctMemPoly":
+        L = xLen - memLen + 1
+        # absPow = abs(x).^(1:degLen-1)
+        absPow = np.abs(x).reshape(-1, 1) ** np.arange(1, degLen)
+        a = np.arange(memLen, 0, -1).reshape(-1, 1)
+        b = np.arange(0, xLen * (degLen - 1), xLen).reshape(1, -1)
+        partTop1 = (a + b).reshape(1, -1, order="F")
+        rows = np.arange(0, L).reshape(-1, 1)
+        topVals = absPow.flatten(order="F")[(rows + partTop1) - 1]
+        topPlane_2d = np.concatenate([np.ones((L, 1)), topVals], axis=1)
+        ncolsTop = memLen * (degLen - 1) + 1
+        topPlane = topPlane_2d.T.reshape(1, ncolsTop, L)
+        sideIdx = rows + a.reshape(1, -1)
+        side = x[sideIdx - 1]
+        sidePlane = side.T.reshape(memLen, 1, L)
+        cube = sidePlane * topPlane
+        xVec = cube.reshape(memLen * ncolsTop, L, order="F").T
     else:
-        y_sig = _apply_mp(x_sig, C)
+        raise ValueError(f"未知模型类型 {modType}")
 
-    if out_sc_db != 0:
-        y_sig = y_sig * 10 ** (out_sc_db / 20.0)
-
-    M = C.shape[0]
-    skip = M + 2
-    amp_in, amp_out, phi_deg = _extract_amam_ampm(x_sig, y_sig, n_bins=40, skip=skip)
-
-    # 幅度 → dBm
-    pin_bin  = 10 * np.log10(np.clip(amp_in  ** 2 / 1e-3, 1e-30, None))
-    pout_bin = 10 * np.log10(np.clip(amp_out ** 2 / 1e-3, 1e-30, None))
-
-    pout_interp = np.interp(pin_arr, pin_bin, pout_bin,
-                            left=pout_bin[0],  right=pout_bin[-1])
-    phi_interp  = np.interp(pin_arr, pin_bin, phi_deg,
-                            left=phi_deg[0],   right=phi_deg[-1])
-    return pout_interp, phi_interp
+    rhs = y[memLen - 1:xLen]
+    # 用 QR + 列主元最小二乘（LAPACK gelsy），与 MATLAB 反斜杠 mldivide
+    # 同属一类算法。注意：PA 数据为 7 倍过采样，线性抽头
+    # x(n-m) 高度共线，最小二乘解在该子空间内非唯一——不同 LAPACK
+    # 例程会给出不同但等价的系数（预测输出与增益曲线一致）。
+    import scipy.linalg as _sla
+    coef, *_ = _sla.lstsq(xVec, rhs, lapack_driver="gelsy")
+    return coef.reshape(memLen, -1, order="F")
 
 
-def _default_mp_coeffs(M=3, D=3):
+def mp_signal_generator(x, coefMat, modType):
     """
-    MP 默认系数矩阵 (M, D)，C[m, d]
-    d=0: 线性; d=1: 三阶非线性; d=2: 五阶非线性
-    m=0: 主路; m=1,2: 记忆抽头
+    signalGenerator：由输入信号与系数矩阵生成功放输出（向量化实现，
+    与 MATLAB 逐点循环算法数值等价）。
     """
-    C = np.zeros((M, D), dtype=complex)
-    if D >= 1: C[0, 0] =  1.0000 + 0.0000j
-    if D >= 2: C[0, 1] = -0.0500 + 0.0100j
-    if D >= 3: C[0, 2] = -0.0200 + 0.0050j
-    if M >= 2:
-        if D >= 1: C[1, 0] =  0.0200 + 0.0050j
-        if D >= 2: C[1, 1] = -0.0100 + 0.0020j
-    if M >= 3:
-        if D >= 1: C[2, 0] =  0.0050 + 0.0010j
-    return C
+    x = np.asarray(x).ravel()
+    memLen, numCols = coefMat.shape
+    N = len(x)
+    y = np.zeros(N, dtype=complex)
+
+    # 预计算延迟副本 xd[m][n] = x[n-m]
+    xd = np.zeros((memLen, N), dtype=complex)
+    for m in range(memLen):
+        xd[m, m:] = x[:N - m]
+    ad = np.abs(xd)
+
+    if modType == "memPoly":
+        degLen = numCols
+        for m in range(memLen):
+            for d in range(degLen):
+                y += coefMat[m, d] * xd[m] * (ad[m] ** d)
+
+    elif modType == "ctMemPoly":
+        degLen = round((numCols - 1) / memLen) + 1
+        # col 0: 线性项
+        for m in range(memLen):
+            y += coefMat[m, 0] * xd[m]
+        # col = 1 + memLen*(powIdx-1) + l
+        for powIdx in range(1, degLen):
+            for l in range(memLen):
+                col = 1 + memLen * (powIdx - 1) + l
+                env = ad[l] ** powIdx
+                for m in range(memLen):
+                    y += coefMat[m, col] * xd[m] * env
+    else:
+        raise ValueError(f"未知模型类型 {modType}")
+
+    y[:memLen - 1] = 0
+    return y
 
 
-def _default_ctm_coeffs(M=3, D=3):
+def mp_error_measure(x, y, coefMat, modType):
     """
-    CTM 默认系数矩阵 (M, M*(D-1)+1)，按 fit_memory_poly_model 列顺序。
-
-    col=0:    线性项 C[m,0]
-    col=j+1:  l=M-1-(j%M), d=j//M+1
-
-    默认值参考典型 TWT 特性，主对角（l=0，即 j%M=M-1）用 MP 同等系数，
-    交叉项（l≠0）用主项的 0.1 倍。
+    errorMeasure：计算时域 RMS 误差百分比 (IEEE 802.11a Eq.28)。
     """
-    ncols = M * (D - 1) + 1
-    C = np.zeros((M, ncols), dtype=complex)
-
-    # col=0: 线性项（与 MP 一致）
-    C[0, 0] =  1.0000 + 0.0000j
-    if M >= 2: C[1, 0] =  0.0200 + 0.0050j
-    if M >= 3: C[2, 0] =  0.0050 + 0.0010j
-
-    # 交叉项列：对每个 j，l=M-1-(j%M), d=j//M+1
-    # l=0 对应 j%M=M-1，即每段最后一列 → 等同于 MP 非线性项（自身延迟）
-    # l≠0 为真正的交叉项，用主项的 0.1 倍
-    mp_nonlin = {
-        (0, 1): -0.0500 + 0.0100j,   # m=0, d=1 (三阶)
-        (0, 2): -0.0200 + 0.0050j,   # m=0, d=2 (五阶)
-        (1, 1): -0.0100 + 0.0020j,   # m=1, d=1
-    }
-    for j in range(M * (D - 1)):
-        l = M - 1 - (j % M)
-        d = j // M + 1
-        col = j + 1
-        for m in range(M):
-            base = mp_nonlin.get((m, d), 0j)
-            if l == 0:
-                C[m, col] = base          # 自身延迟：用 MP 系数
-            elif base != 0j:
-                C[m, col] = base * 0.1    # 交叉延迟：用 10% 衰减
-    return C
+    memLen = coefMat.shape[0]
+    yp = mp_signal_generator(x, coefMat, modType)
+    err = y[memLen - 1:] - yp[memLen - 1:]
+    return np.sqrt(np.mean(np.abs(err) ** 2)) / \
+        np.sqrt(np.mean(np.abs(y[memLen - 1:]) ** 2)) * 100
 
 
 # ══════════════════════════════════════════════════════════
@@ -291,13 +302,12 @@ def _default_ctm_coeffs(M=3, D=3):
 # ══════════════════════════════════════════════════════════
 
 def _f(text, default=0.0):
-    try:    return float(text.strip())
+    try:    return float(str(text).strip())
     except: return default
 
-def _vec2(text, default=(1.0, 1.0)):
-    import re
-    nums = re.findall(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', text)
-    return (float(nums[0]), float(nums[1])) if len(nums) >= 2 else default
+def _i(text, default=0):
+    try:    return int(float(str(text).strip()))
+    except: return default
 
 
 # ══════════════════════════════════════════════════════════
@@ -306,7 +316,7 @@ def _vec2(text, default=(1.0, 1.0)):
 
 class PlotCanvas(FigureCanvas):
     def __init__(self):
-        self.fig = Figure(figsize=(6.5, 6), dpi=96)
+        self.fig = Figure(figsize=(7, 6.4), dpi=96)
         self.fig.patch.set_facecolor("#F8F8F8")
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
@@ -317,7 +327,7 @@ class PlotCanvas(FigureCanvas):
 
 
 # ══════════════════════════════════════════════════════════
-#  UI 辅助
+#  UI 样式
 # ══════════════════════════════════════════════════════════
 
 _ES = ("QLineEdit{background:#FFF;border:1px solid #D0D0D0;"
@@ -329,15 +339,17 @@ _GB = ("QGroupBox{background:#FFF;border:1px solid #E0E0E0;"
        "QGroupBox::title{subcontrol-origin:margin;left:10px;"
        "padding:0 4px;color:#BA7517;font-size:9pt;font-weight:bold;}")
 
+
 def _group(title):
     gb = QGroupBox(title); gb.setStyleSheet(_GB)
-    vl = QVBoxLayout(gb); vl.setSpacing(4); vl.setContentsMargins(6,4,6,6)
+    vl = QVBoxLayout(gb); vl.setSpacing(4); vl.setContentsMargins(6, 4, 6, 6)
     return gb
+
 
 def _form_row(form, label, default, hint="", w=140):
     lbl = QLabel(label); lbl.setStyleSheet(_LS)
     container = QWidget(); hl = QHBoxLayout(container)
-    hl.setContentsMargins(0,0,0,0); hl.setSpacing(6)
+    hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(6)
     edit = QLineEdit(default); edit.setFixedWidth(w); edit.setStyleSheet(_ES)
     hl.addWidget(edit)
     if hint:
@@ -354,20 +366,25 @@ def _form_row(form, label, default, hint="", w=140):
 # ══════════════════════════════════════════════════════════
 
 class PAModelDialog(ModuleDialog):
-    TITLE        = "功放模型"
+    TITLE        = "功放表征"
     ACCENT_COLOR = "#BA7517"
-    MIN_WIDTH    = 980
-    MIN_HEIGHT   = 660
+    MIN_WIDTH    = 1040
+    MIN_HEIGHT   = 700
 
+    # 模型类型：显示名 -> (内部 modType, 简称)
     _MODELS = [
-        ("── 无记忆 ──",       None),
-        ("Saleh",              "saleh"),
-        ("Modified Rapp",      "rapp"),
-        ("── 有记忆 ──",       None),
-        ("Memory Polynomial",  "mp"),
-        ("Cross-Term Memory",  "ctm"),
+        ("Memory Polynomial (MP)",        "memPoly"),
+        ("Cross-Term Memory (CM)",        "ctMemPoly"),
     ]
 
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.pa_data = None      # PAData
+        self.tx_waveform = None  # 生成的 OFDM
+        self.coef_mat = None     # fitCoefMatMem
+        self.last_modType = None
+
+    # ──────────────────────────────────────────────────────
     def build_content(self, layout: QVBoxLayout):
         layout.setContentsMargins(10, 8, 10, 10)
         layout.setSpacing(0)
@@ -378,309 +395,419 @@ class PAModelDialog(ModuleDialog):
 
         # ══ 左侧配置 ══════════════════════════════════════
         left = QWidget()
-        left.setMinimumWidth(280); left.setMaximumWidth(360)
+        left.setMinimumWidth(310); left.setMaximumWidth(390)
         lv = QVBoxLayout(left)
-        lv.setContentsMargins(0,0,8,0); lv.setSpacing(7)
+        lv.setContentsMargins(0, 0, 8, 0); lv.setSpacing(7)
 
-        # ── 模型选择 ──────────────────────────────────────
-        mg = _group("模型选择")
-        mf = QFormLayout(); mf.setSpacing(5); mf.setContentsMargins(0,0,0,0)
-        ml = QLabel("模型类型"); ml.setStyleSheet(_LS)
-        self.combo = QComboBox()
-        self.combo.setStyleSheet(
+        # ── ① 功放数据文件 ─────────────────────────────────
+        dg = _group("① 功放实测数据")
+        df = QVBoxLayout(); df.setSpacing(5)
+        fl = QHBoxLayout(); fl.setSpacing(6)
+        self.e_file = QLineEdit(); self.e_file.setReadOnly(True)
+        self.e_file.setStyleSheet(_ES)
+        self.e_file.setPlaceholderText("helperPACharSavedData100MHz.mat")
+        btn_browse = QPushButton("浏览…")
+        btn_browse.setFixedWidth(64); btn_browse.setFixedHeight(28)
+        btn_browse.setStyleSheet(
+            "QPushButton{background:#FFF;color:#444;border:1px solid #CCC;"
+            "border-radius:4px;font-size:9pt;}"
+            "QPushButton:hover{background:#F5F5F5;}")
+        btn_browse.clicked.connect(self._browse_file)
+        fl.addWidget(self.e_file); fl.addWidget(btn_browse)
+        df.addLayout(fl)
+        self.lbl_datainfo = QLabel("未加载数据")
+        self.lbl_datainfo.setStyleSheet("font-size:8.5pt;color:#888;")
+        self.lbl_datainfo.setWordWrap(True)
+        df.addWidget(self.lbl_datainfo)
+        dg.layout().addLayout(df)
+        lv.addWidget(dg)
+
+        # ── ② OFDM 测试波形 ───────────────────────────────
+        og = _group("② OFDM 测试波形")
+        of = QFormLayout(); of.setSpacing(5); of.setContentsMargins(0, 0, 0, 0)
+        ol = QLabel("信道带宽"); ol.setStyleSheet(_LS)
+        self.combo_bw = QComboBox()
+        self.combo_bw.setStyleSheet(
             "QComboBox{background:#FFF;border:1px solid #D0D0D0;"
             "border-radius:3px;padding:3px 8px;font-size:10pt;color:#111;}"
             "QComboBox QAbstractItemView{background:#FFF;border:1px solid #D0D0D0;"
             "color:#111;selection-background-color:#FAEEDA;font-size:10pt;}")
+        for s in ["5 MHz", "15 MHz", "40 MHz", "100 MHz"]:
+            self.combo_bw.addItem(s)
+        self.combo_bw.setCurrentIndex(3)
+        of.addRow(ol, self.combo_bw)
+        og.layout().addLayout(of)
+        self.btn_ofdm = QPushButton("生成 OFDM 并绘制 AM/AM、Gain")
+        self.btn_ofdm.setFixedHeight(30)
+        self.btn_ofdm.setStyleSheet(
+            "QPushButton{background:#FFF;color:#BA7517;border:1px solid #BA7517;"
+            "border-radius:5px;font-size:9.5pt;font-weight:bold;}"
+            "QPushButton:hover{background:#FAEEDA;}")
+        self.btn_ofdm.clicked.connect(self._run_characterize)
+        og.layout().addWidget(self.btn_ofdm)
+        lv.addWidget(og)
+
+        # ── ③ 拟合模型 ────────────────────────────────────
+        mg = _group("③ 记忆多项式拟合模型")
+        mf = QFormLayout(); mf.setSpacing(5); mf.setContentsMargins(0, 0, 0, 0)
+        ml = QLabel("模型类型"); ml.setStyleSheet(_LS)
+        self.combo_model = QComboBox()
+        self.combo_model.setStyleSheet(self.combo_bw.styleSheet())
         for name, _ in self._MODELS:
-            self.combo.addItem(name)
-        for i, (n, k) in enumerate(self._MODELS):
-            if k is None:
-                it = self.combo.model().item(i)
-                it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-                it.setForeground(Qt.GlobalColor.gray)
-        self.combo.setCurrentIndex(1)
-        self.combo.currentIndexChanged.connect(self._switch)
-        mf.addRow(ml, self.combo)
+            self.combo_model.addItem(name)
+        mf.addRow(ml, self.combo_model)
         mg.layout().addLayout(mf)
-        lv.addWidget(mg)
 
-        # ── 参数面板（切换显示）──────────────────────────
-        self.saleh_g = self._build_saleh()
-        self.rapp_g  = self._build_rapp()
-        self.mp_g    = self._build_mp()
-        self.ctm_g   = self._build_ctm()
-        for g in (self.saleh_g, self.rapp_g, self.mp_g, self.ctm_g):
-            lv.addWidget(g)
+        note = QLabel(
+            "MP : y(n)=ΣΣ C[m,d]·x(n-m)·|x(n-m)|^d\n"
+            "CM : 含所有延迟时刻的包络交叉项\n"
+            "memLen=记忆长度  degLen=多项式阶数")
+        note.setStyleSheet("font-size:8pt;color:#666;padding:2px 0;")
+        note.setWordWrap(True)
+        mg.layout().addWidget(note)
 
-        # ── 输入功率范围 ───────────────────────────────────
-        pg = _group("输入功率范围")
-        pf = QFormLayout(); pf.setSpacing(5); pf.setContentsMargins(0,0,0,0)
-        self.e_pmin = _form_row(pf, "Pin 起始 (dBm):", "-10", "", 80)
-        self.e_pmax = _form_row(pf, "Pin 终止 (dBm):",  "50", "", 80)
-        self.e_npts = _form_row(pf, "点数:",            "300", "", 65)
-        pg.layout().addLayout(pf)
-        lv.addWidget(pg)
+        pf = QFormLayout(); pf.setSpacing(5); pf.setContentsMargins(0, 0, 0, 0)
+        self.e_memlen = _form_row(pf, "memLen 记忆长度:", "5", "", 60)
+        self.e_deglen = _form_row(pf, "degLen 多项式阶数:", "5", "", 60)
+        mg.layout().addLayout(pf)
 
-        # ── 按钮 ──────────────────────────────────────────
-        bhl = QHBoxLayout(); bhl.setSpacing(8); bhl.setContentsMargins(0,4,0,0)
-        self.btn_run = QPushButton("计算并绘图")
-        self.btn_run.setFixedHeight(32)
-        self.btn_run.setStyleSheet(
+        self.btn_fit = QPushButton("拟合模型并绘制 Gain 对比")
+        self.btn_fit.setFixedHeight(32)
+        self.btn_fit.setStyleSheet(
             "QPushButton{background:#BA7517;color:#FFF;border:none;"
             "border-radius:5px;font-size:10pt;font-weight:bold;}"
             "QPushButton:hover{background:#8B5A0F;}")
-        self.btn_run.clicked.connect(self._run)
-        bhl.addWidget(self.btn_run)
-        self.btn_save = QPushButton("保存图像")
-        self.btn_save.setFixedHeight(32)
-        self.btn_save.setStyleSheet(
+        self.btn_fit.clicked.connect(self._run_fit)
+        mg.layout().addWidget(self.btn_fit)
+        lv.addWidget(mg)
+
+        # ── ④ 拟合系数 / 导出 ─────────────────────────────
+        cg = _group("④ 拟合系数 fitCoefMatMem")
+        self.txt_coef = QPlainTextEdit()
+        self.txt_coef.setReadOnly(True)
+        self.txt_coef.setFixedHeight(110)
+        self.txt_coef.setStyleSheet(
+            "QPlainTextEdit{background:#FFF;border:1px solid #D0D0D0;"
+            "border-radius:3px;font-family:Consolas,monospace;"
+            "font-size:8.5pt;color:#222;}")
+        self.txt_coef.setPlainText("尚未拟合")
+        cg.layout().addWidget(self.txt_coef)
+        eh = QHBoxLayout(); eh.setSpacing(8)
+        self.btn_export = QPushButton("导出系数与参数")
+        self.btn_export.setFixedHeight(30)
+        self.btn_export.setStyleSheet(
             "QPushButton{background:#FFF;color:#444;border:1px solid #CCC;"
-            "border-radius:5px;font-size:10pt;}"
+            "border-radius:5px;font-size:9.5pt;}"
             "QPushButton:hover{background:#F5F5F5;}")
+        self.btn_export.clicked.connect(self._export)
+        eh.addWidget(self.btn_export)
+        self.btn_save = QPushButton("保存图像")
+        self.btn_save.setFixedHeight(30)
+        self.btn_save.setStyleSheet(self.btn_export.styleSheet())
         self.btn_save.clicked.connect(self._save)
-        bhl.addWidget(self.btn_save)
-        lv.addLayout(bhl)
+        eh.addWidget(self.btn_save)
+        cg.layout().addLayout(eh)
+        lv.addWidget(cg)
+
         lv.addStretch()
         sp.addWidget(left)
 
         # ══ 右侧画布 ══════════════════════════════════════
         right = QWidget(); rv = QVBoxLayout(right)
-        rv.setContentsMargins(6,0,0,0); rv.setSpacing(4)
+        rv.setContentsMargins(6, 0, 0, 0); rv.setSpacing(4)
         self.canvas = PlotCanvas()
         rv.addWidget(self.canvas)
-        self.status = QLabel("就绪")
+        self.status = QLabel("就绪 — 请先加载功放数据文件")
         self.status.setStyleSheet("font-size:9pt;color:#888;")
         rv.addWidget(self.status)
         sp.addWidget(right)
         sp.setStretchFactor(0, 0); sp.setStretchFactor(1, 1)
         layout.addWidget(sp, stretch=1)
 
-        self._switch(1)
-
-    # ── 参数面板 ──────────────────────────────────────────
-
-    def _build_saleh(self):
-        g = _group("Saleh 参数")
-        f = QFormLayout(); f.setSpacing(5); f.setContentsMargins(0,0,0,0)
-        note = QLabel("AM/AM: F(r)=αₐ·r/(1+βₐ·r²)\n"
-                       "AM/PM: Φ(r)=αₚ·r²/(1+βₚ·r²)  [rad]")
-        note.setStyleSheet("font-size:8pt;color:#555;padding:2px 0;")
-        note.setWordWrap(True); g.layout().addWidget(note)
-        g.layout().addLayout(f)
-        self.s_in   = _form_row(f, "Input scaling (dB):",           "0",                "", 70)
-        self.s_amam = _form_row(f, "AM/AM 参数 [alpha beta]:",       "[ 2.1587, 1.1517 ]","", 175)
-        self.s_ampm = _form_row(f, "AM/PM 参数 [alpha beta]:",       "[ 4.0033, 9.1040 ]","", 175)
-        self.s_out  = _form_row(f, "Output scaling (dB):",           "0",                "", 70)
-        return g
-
-    def _build_rapp(self):
-        g = _group("Modified Rapp 参数")
-        f = QFormLayout(); f.setSpacing(5); f.setContentsMargins(0,0,0,0)
-        note = QLabel("AM/AM: g·r/(1+(g·r/Vsat)^{2p})^{1/2p}\n"
-                       "AM/PM: A·r^q1/(1+(r/B)^q2)  [rad]")
-        note.setStyleSheet("font-size:8pt;color:#555;padding:2px 0;")
-        note.setWordWrap(True); g.layout().addWidget(note)
-        g.layout().addLayout(f)
-        self.r_gain = _form_row(f, "Linear power gain (dB):",    "7",           "", 70)
-        self.r_vsat = _form_row(f, "Output saturation level (V):","1",           "", 70)
-        self.r_p    = _form_row(f, "Magnitude smoothness factor:","2",           "", 70)
-        self.r_A    = _form_row(f, "Phase gain (rad):",           "-.45", "-0.45", 70)
-        self.r_B    = _form_row(f, "Phase saturation:",           ".88",  "0.88",  70)
-        self.r_q    = _form_row(f, "Phase smoothness factor:",    "[ 3.43, 3.43 ]","", 140)
-        return g
-
-    def _build_mp(self):
-        g = _group("Memory Polynomial (eq.19)")
-        f = QFormLayout(); f.setSpacing(5); f.setContentsMargins(0,0,0,0)
-        note = QLabel(
-            "y(n) = Σ_{m=0}^{M-1} Σ_{d=0}^{D-1} C[m,d]·x(n-m)·|x(n-m)|^d\n"
-            "C 矩阵维度: M×D（M=记忆深度，D=电压阶次）\n"
-            "d=0:线性  d=1:三阶  d=2:五阶...\n"
-            "使用 OFDM 信号提取 AM/AM 和 AM/PM")
-        note.setStyleSheet("font-size:8pt;color:#555;padding:2px 0;")
-        note.setWordWrap(True); g.layout().addWidget(note)
-        g.layout().addLayout(f)
-        self.mp_M   = _form_row(f, "记忆深度 M:", "3", "", 60)
-        self.mp_D   = _form_row(f, "电压阶次 D:", "3", "", 60)
-        self.mp_in  = _form_row(f, "Input scaling (dB):",  "0", "", 60)
-        self.mp_out = _form_row(f, "Output scaling (dB):", "0", "", 60)
-        self.mp_sym = _form_row(f, "OFDM 符号数:", "60", "", 60)
-        return g
-
-    def _build_ctm(self):
-        g = _group("Cross-Term Memory (eq.23)")
-        f = QFormLayout(); f.setSpacing(5); f.setContentsMargins(0,0,0,0)
-        note = QLabel(
-            "M_CTM[m,col] = x(n-m)·|x(n-l)|^d\n"
-            "C 矩阵维度: M × (M·(D-1)+1)\n"
-            "包含所有延迟时刻的包络交叉项\n"
-            "使用 OFDM 信号提取 AM/AM 和 AM/PM")
-        note.setStyleSheet("font-size:8pt;color:#555;padding:2px 0;")
-        note.setWordWrap(True); g.layout().addWidget(note)
-        g.layout().addLayout(f)
-        self.ctm_M   = _form_row(f, "记忆深度 M:", "3", "", 60)
-        self.ctm_D   = _form_row(f, "电压阶次 D:", "3", "", 60)
-        self.ctm_in  = _form_row(f, "Input scaling (dB):",  "0", "", 60)
-        self.ctm_out = _form_row(f, "Output scaling (dB):", "0", "", 60)
-        self.ctm_sym = _form_row(f, "OFDM 符号数:", "60", "", 60)
-        return g
-
-    # ── 切换 ──────────────────────────────────────────────
-
-    def _switch(self, _=None):
-        key = self._key()
-        self.saleh_g.setVisible(key == "saleh")
-        self.rapp_g.setVisible(key == "rapp")
-        self.mp_g.setVisible(key == "mp")
-        self.ctm_g.setVisible(key == "ctm")
-
-    def _key(self):
-        i = self.combo.currentIndex()
-        return self._MODELS[i][1] if 0 <= i < len(self._MODELS) else None
-
-    # ── 计算 ──────────────────────────────────────────────
-
-    def _run(self):
-        try:    self._do_run()
+    # ──────────────────────────────────────────────────────
+    #  ① 文件加载
+    # ──────────────────────────────────────────────────────
+    def _browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择功放数据文件", "",
+            "MAT 文件 (*.mat);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            self.pa_data = load_pa_data(path)
         except Exception as e:
-            import traceback; traceback.print_exc()
-            QMessageBox.critical(self, "计算错误", str(e))
-
-    def _do_run(self):
-        key = self._key()
-        if not key:
-            self.status.setText("请选择有效模型"); return
-
-        pmin = _f(self.e_pmin.text(), -10)
-        pmax = _f(self.e_pmax.text(),  50)
-        N    = max(10, int(_f(self.e_npts.text(), 300)))
-        pins = np.linspace(pmin, pmax, N)
-
-        if key == "saleh":
-            isc    = _f(self.s_in.text(),   0)
-            osc    = _f(self.s_out.text(),  0)
-            aa, ba = _vec2(self.s_amam.text(), (2.1587, 1.1517))
-            ap, bp = _vec2(self.s_ampm.text(), (4.0033, 9.1040))
-            r      = _dbm2r_arr(pins + isc)
-            pout   = _r2dbm_arr(saleh_amam(r, aa, ba)) + osc
-            phi    = saleh_ampm(r, ap, bp)
-            g_db   = 20 * math.log10(aa) + osc + isc
-            title  = "Saleh"
-
-        elif key == "rapp":
-            G_db   = _f(self.r_gain.text(), 7)
-            g_lin  = 10 ** (G_db / 20.0)
-            vsat   = _f(self.r_vsat.text(), 1.0)
-            p      = _f(self.r_p.text(),    2.0)
-            A      = _f(self.r_A.text(),   -0.45)
-            B      = _f(self.r_B.text(),    0.88)
-            q1, q2 = _vec2(self.r_q.text(), (3.43, 3.43))
-            r      = _dbm2r_arr(pins)
-            pout   = _r2dbm_arr(rapp_amam(r, g_lin, vsat, p))
-            phi    = rapp_ampm(r, A, B, q1, q2)
-            g_db   = G_db
-            title  = "Modified Rapp"
-
-        elif key == "mp":
-            M   = max(1, int(_f(self.mp_M.text(),   3)))
-            D   = max(1, int(_f(self.mp_D.text(),   3)))
-            isc = _f(self.mp_in.text(),  0)
-            osc = _f(self.mp_out.text(), 0)
-            n_sym = max(10, int(_f(self.mp_sym.text(), 60)))
-            C   = _default_mp_coeffs(M, D)
-            self.status.setText("计算中，请稍候（OFDM 信号处理）…")
-            QWidget.repaint(self)
-            pout, phi = _mem_sweep(pins, C, 'MP', isc, osc, n_sym=n_sym)
-            g_db  = 20 * math.log10(abs(C[0, 0]) + 1e-30) + isc + osc
-            title = f"Memory Polynomial  (M={M}, D={D})"
-
-        elif key == "ctm":
-            M   = max(1, int(_f(self.ctm_M.text(),   3)))
-            D   = max(1, int(_f(self.ctm_D.text(),   3)))
-            isc = _f(self.ctm_in.text(),  0)
-            osc = _f(self.ctm_out.text(), 0)
-            n_sym = max(10, int(_f(self.ctm_sym.text(), 60)))
-            C   = _default_ctm_coeffs(M, D)
-            self.status.setText("计算中，请稍候（OFDM 信号处理）…")
-            QWidget.repaint(self)
-            pout, phi = _mem_sweep(pins, C, 'CTM', isc, osc, n_sym=n_sym)
-            g_db  = 20 * math.log10(abs(C[0, 0]) + 1e-30) + isc + osc
-            title = f"Cross-Term Memory  (M={M}, D={D})"
-
-        else:
+            QMessageBox.critical(self, "加载失败", str(e))
             return
 
-        sat_i    = int(np.argmax(pout))
-        pin_sat  = pins[sat_i]
-        pout_sat = pout[sat_i]
-        lin_ref  = pins + g_db
+        d = self.pa_data
+        self.e_file.setText(os.path.basename(path))
+        info = (f"输入波形: {len(d.input_wave)} 点  |  "
+                f"输出波形: {len(d.output_wave)} 点\n"
+                f"采样率: {d.sample_rate/1e6:.1f} MHz  |  "
+                f"过采样: {d.oversampling_rate}  |  帧数: {d.num_frames}\n"
+                f"线性增益: {d.linear_gain:.2f} dB"
+                + (f"  |  带宽: {d.bw/1e6:.0f} MHz" if d.bw else ""))
+        self.lbl_datainfo.setText(info)
+        self.lbl_datainfo.setStyleSheet("font-size:8.5pt;color:#3A7D44;")
+        # 同步带宽下拉
+        if d.bw:
+            for i, s in enumerate(["5 MHz", "15 MHz", "40 MHz", "100 MHz"]):
+                if abs(float(s.split()[0]) * 1e6 - d.bw) < 1:
+                    self.combo_bw.setCurrentIndex(i)
+        self.status.setText("数据已加载 — 可生成 OFDM 并绘制曲线")
+        # 自动绘制实测特性
+        self._run_characterize()
 
-        self._plot(pins, pout, phi, lin_ref, g_db, pin_sat, pout_sat, title)
-        self.status.setText(
-            f"{title}  |  G={g_db:.1f}dB  "
-            f"Pout_sat={pout_sat:.1f}dBm @ Pin={pin_sat:.1f}dBm")
+    def _bw_value(self):
+        return float(self.combo_bw.currentText().split()[0]) * 1e6
 
-    # ── 绘图 ──────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────
+    #  ② / ③ 实测特性绘制
+    # ──────────────────────────────────────────────────────
+    def _run_characterize(self):
+        if self.pa_data is None:
+            QMessageBox.information(self, "提示", "请先加载功放数据文件")
+            return
+        try:
+            self.status.setText("生成 OFDM 测试波形…")
+            QWidget.repaint(self)
+            bw = self._bw_value()
+            tx, sr, nf = generate_ofdm(bw)
+            self.tx_waveform = tx
+            self._plot_characterization()
+            self.status.setText(
+                f"OFDM 已生成: {len(tx)} 点 @ {sr/1e6:.1f} MHz, "
+                f"{nf} 帧  |  已绘制实测 AM/AM 与 Gain 曲线")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "错误", str(e))
 
-    def _plot(self, pins, pout, phi, lin_ref, g_db,
-              pin_sat, pout_sat, title):
+    def _plot_characterization(self):
+        """绘制实测 AM/AM 与 Gain vs Input Power（上 OFDM 频谱，下 AM/AM+Gain）。"""
+        d = self.pa_data
+        refP = d.reference_power
+        amam = d.measured_amam
+
         fig = self.canvas.fig
         fig.clf()
         fig.set_constrained_layout(True)
-        fig.set_constrained_layout_pads(w_pad=0.05, h_pad=0.08,
-                                        hspace=0.08, wspace=0.05)
-        ax1, ax2 = fig.subplots(2, 1)
+        ax1, ax2, ax3 = fig.subplots(3, 1)
         fig.patch.set_facecolor("#F8F8F8")
 
-        # AM/AM
+        # — OFDM 输入频谱（PA Input）—
         ax1.set_facecolor("#FFFFFF")
-        ax1.plot(pins, pout,    color="#0055CC", lw=2,   label=title.split("  ")[0])
-        ax1.plot(pins, lin_ref, color="#CC2200", lw=1.2, ls="-.", label="Linear Gain")
-        ax1.plot(pin_sat, pout_sat, "o", color="#555", ms=7, zorder=5)
-        ax1.axhline(pout_sat, color="#AAAAAA", lw=0.8, ls="--")
-        ax1.axvline(pin_sat,  color="#AAAAAA", lw=0.8, ls="--")
-
-        ylim = ax1.get_ylim()
-        yr   = ylim[1] - ylim[0] if ylim[1] != ylim[0] else 1
-        xr   = pins[-1] - pins[0]
-        ax1.text(pins[0] + xr*0.03, pout_sat + yr*0.04,
-                 f"Pout$_{{sat}}$ = {pout_sat:.1f}", fontsize=8.5, color="#333")
-        ax1.annotate(f"← Pin$_{{sat}}$ = {pin_sat:.1f}",
-                     xy=(pin_sat, pout_sat),
-                     xytext=(pin_sat - xr*0.32, pout_sat - yr*0.15),
-                     fontsize=8.5, color="#333",
-                     arrowprops=dict(arrowstyle="->", color="#888", lw=0.8))
-        ax1.annotate(f"Pout = Pin + {g_db:.1f}",
-                     xy=(pins[len(pins)//4], lin_ref[len(pins)//4]),
-                     xytext=(pins[len(pins)//4] + xr*0.08,
-                             lin_ref[len(pins)//4] + yr*0.06),
-                     fontsize=8.5, color="#CC2200",
-                     arrowprops=dict(arrowstyle="->", color="#CC2200", lw=0.8))
-        ax1.set_xlabel("P$_{in}$  (dBm)", fontsize=9)
-        ax1.set_ylabel("P$_{out}$  (dBm)", fontsize=9)
-        ax1.set_title(f"{title} AM/AM", fontsize=10)
-        ax1.legend(fontsize=8.5, framealpha=0.9, edgecolor="#DDD", loc="upper left")
+        x = self.tx_waveform
+        sr = d.sample_rate or 1.0
+        win = np.hanning(len(x))
+        X = np.fft.fftshift(np.fft.fft(x * win))
+        psd = 20 * np.log10(np.abs(X) / np.max(np.abs(X)) + 1e-12)
+        freq = np.fft.fftshift(np.fft.fftfreq(len(x), 1 / sr)) / 1e6
+        ax1.plot(freq, psd, color="#0055CC", lw=0.7)
+        ax1.set_xlabel("频率 (MHz)", fontsize=9)
+        ax1.set_ylabel("归一化功率 (dB)", fontsize=9)
+        ax1.set_title("OFDM 测试波形频谱 (PA Input)", fontsize=10)
+        ax1.set_ylim([-100, 5])
         ax1.grid(True, color="#E8E8E8", lw=0.5)
-        for s in ax1.spines.values(): s.set_color("#CCCCCC")
-        ax1.tick_params(labelsize=8)
 
-        # AM/PM
+        # — AM/AM —
         ax2.set_facecolor("#FFFFFF")
-        ax2.plot(pins, phi, color="#0055CC", lw=2)
-        ax2.set_xlabel("P$_{in}$  (dBm)", fontsize=9)
-        ax2.set_ylabel("Phase  (degs)", fontsize=9)
-        ax2.set_title(f"{title} AM/PM", fontsize=10)
+        ax2.plot(refP, refP + amam, ".", color="#0055CC", ms=2)
+        ax2.set_xlabel("输入功率 (dBm)", fontsize=9)
+        ax2.set_ylabel("输出功率 (dBm)", fontsize=9)
+        ax2.set_title("AM/AM 实测特性", fontsize=10)
         ax2.grid(True, color="#E8E8E8", lw=0.5)
-        for s in ax2.spines.values(): s.set_color("#CCCCCC")
-        ax2.tick_params(labelsize=8)
+
+        # — Gain vs Input Power —
+        ax3.set_facecolor("#FFFFFF")
+        ax3.plot(refP, amam, ".", color="#CC2200", ms=2)
+        ax3.set_xlabel("输入功率 (dBm)", fontsize=9)
+        ax3.set_ylabel("增益 (dB)", fontsize=9)
+        ax3.set_title("Gain vs Input Power 实测特性", fontsize=10)
+        ax3.grid(True, color="#E8E8E8", lw=0.5)
+
+        for ax in (ax1, ax2, ax3):
+            for s in ax.spines.values():
+                s.set_color("#CCCCCC")
+            ax.tick_params(labelsize=8)
 
         self.canvas.draw()
 
+    # ──────────────────────────────────────────────────────
+    #  ④ 模型拟合
+    # ──────────────────────────────────────────────────────
+    def _run_fit(self):
+        if self.pa_data is None:
+            QMessageBox.information(self, "提示", "请先加载功放数据文件")
+            return
+        try:
+            self._do_fit()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "拟合错误", str(e))
+
+    def _do_fit(self):
+        d = self.pa_data
+        paInput = d.input_wave
+        paOutput = d.output_wave
+
+        modType = self._MODELS[self.combo_model.currentIndex()][1]
+        memLen = max(1, _i(self.e_memlen.text(), 5))
+        degLen = max(1, _i(self.e_deglen.text(), 5))
+
+        self.status.setText("拟合记忆多项式系数…")
+        QWidget.repaint(self)
+
+        # —— coefficientFinder：用前半段数据拟合 ——
+        numDataPts = len(paInput)
+        halfDataPts = round(numDataPts / 2)
+        coefMat = mp_coefficient_finder(
+            paInput[:halfDataPts], paOutput[:halfDataPts],
+            memLen, degLen, modType)
+        self.coef_mat = coefMat
+        self.last_modType = modType
+
+        # —— errorMeasure：全段时域 RMS 误差 ——
+        self.status.setText("计算时域 RMS 误差…")
+        QWidget.repaint(self)
+        rmsErr = mp_error_measure(paInput, paOutput, coefMat, modType)
+
+        # —— 由模型生成拟合输出 paOutputFitMem ——
+        paOutputFit = mp_signal_generator(paInput, coefMat, modType)
+
+        # —— 显示系数矩阵 abs(fitCoefMatMem) ——
+        absC = np.abs(coefMat)
+        lines = [f"模型: {modType}   memLen={memLen}  degLen={degLen}",
+                 f"系数矩阵维度: {coefMat.shape[0]} × {coefMat.shape[1]}",
+                 "abs(fitCoefMatMem):"]
+        for row in absC:
+            lines.append("  " + "  ".join(f"{v:9.4f}" for v in row))
+        lines.append(f"时域 RMS 误差: {rmsErr:.4f} %")
+        lines.append("注: 数据为7倍过采样，线性抽头共线，")
+        lines.append("    系数解非唯一；增益曲线与RMS误差为准。")
+        self.txt_coef.setPlainText("\n".join(lines))
+
+        # —— 绘制 Gain 拟合对比 (helperPACharPlotGain) ——
+        self._plot_gain(paInput, paOutput, paOutputFit, modType, rmsErr)
+
+        short = "MP" if modType == "memPoly" else "CM"
+        self.status.setText(
+            f"{short} 拟合完成  |  memLen={memLen} degLen={degLen}  |  "
+            f"时域 RMS 误差 = {rmsErr:.3f}%")
+
+    def _plot_gain(self, paInput, paOutput, paOutputFit, modType, rmsErr):
+        """
+        helperPACharPlotGain 等效（与 MATLAB 示例图一致）：
+        单幅 "Comparison of Actual and Estimated Gain"，
+        横轴输入功率 (dBm)，纵轴功率增益 (dB)。
+
+          实测增益  Actual Gain    : 蓝色空心圆
+            直接取自数据文件 results.ReferencePower / MeasuredAMToAM
+          估计增益  Estimated Gain : 橙色实心点
+            由记忆多项式模型输出 paOutputFitMem 计算增益
+
+        功率换算与 MATLAB spectrumAnalyzer 一致，参考阻抗负载 100 Ω：
+          P (W)   = |V|^2 / R
+          P (dBm) = 10·log10(P / 1e-3)
+        """
+        REF_LOAD = 100.0          # 与 sa.ReferenceLoad = 100 一致
+        memLen = self.coef_mat.shape[0]
+        d = self.pa_data
+
+        # ── 实测增益：直接用保存的参考功率与 AM/AM 测量 ──
+        refP = d.reference_power          # 输入功率 (dBm)
+        gain_act = d.measured_amam        # 实测增益 (dB)
+
+        # ── 估计增益：由模型预测输出计算 ──
+        # 丢弃前 memLen 个暂态点（与 errorMeasure 一致）
+        xin  = paInput[memLen:]
+        yfit = paOutputFit[memLen:]
+        mask = np.abs(xin) > 1e-9
+        xi, yf = xin[mask], yfit[mask]
+        pin_est  = 10 * np.log10(np.abs(xi) ** 2 / (REF_LOAD * 1e-3) + 1e-30)
+        gain_est = 20 * np.log10(np.abs(yf) / np.abs(xi) + 1e-30)
+
+        short = "MP" if modType == "memPoly" else "CM"
+
+        fig = self.canvas.fig
+        fig.clf()
+        fig.set_constrained_layout(True)
+        ax = fig.subplots(1, 1)
+        fig.patch.set_facecolor("#F8F8F8")
+        ax.set_facecolor("#FFFFFF")
+
+        # 实测增益：蓝色空心圆
+        ax.scatter(refP, gain_act, s=22, facecolors="none",
+                   edgecolors="#1F77B4", linewidths=0.7,
+                   label="Actual Gain")
+        # 估计增益：橙色实心点
+        ax.scatter(pin_est, gain_est, s=6, color="#D95319",
+                   label="Estimated Gain")
+
+        # 坐标轴限制在实测数据的有效区间（与 MATLAB 图一致）
+        x_lo, x_hi = np.min(refP), np.max(refP)
+        y_lo, y_hi = np.min(gain_act), np.max(gain_act)
+        xpad = 0.08 * (x_hi - x_lo)
+        ypad = 0.15 * (y_hi - y_lo)
+        ax.set_xlim(x_lo - xpad, x_hi + xpad)
+        ax.set_ylim(y_lo - ypad, y_hi + ypad)
+
+        ax.set_xlabel("Input Power (dBm)", fontsize=10)
+        ax.set_ylabel("Power Gain (dB)", fontsize=10)
+        ax.set_title(
+            f"Comparison of Actual and Estimated Gain  "
+            f"（{short} 模型, 时域 RMS 误差 = {rmsErr:.3f}%）",
+            fontsize=10)
+        ax.legend(fontsize=9, framealpha=0.95, edgecolor="#DDD",
+                  loc="upper right")
+        ax.grid(True, color="#E8E8E8", lw=0.5)
+        for s in ax.spines.values():
+            s.set_color("#CCCCCC")
+        ax.tick_params(labelsize=9)
+
+        self.canvas.draw()
+
+    # ──────────────────────────────────────────────────────
+    #  导出
+    # ──────────────────────────────────────────────────────
+    def _export(self):
+        if self.coef_mat is None:
+            QMessageBox.information(self, "提示", "请先完成模型拟合")
+            return
+        path, sel = QFileDialog.getSaveFileName(
+            self, "导出拟合系数与参数", "fitCoefMatMem.csv",
+            "CSV 文件 (*.csv);;NumPy 文件 (*.npz);;文本文件 (*.txt)")
+        if not path:
+            return
+        try:
+            modType = self.last_modType
+            short = "MP" if modType == "memPoly" else "CM"
+            memLen = max(1, _i(self.e_memlen.text(), 5))
+            degLen = max(1, _i(self.e_deglen.text(), 5))
+            C = self.coef_mat
+
+            if path.endswith(".npz"):
+                np.savez(path, fitCoefMatMem=C, modType=modType,
+                         memLen=memLen, degLen=degLen)
+            else:
+                # CSV / TXT：写参数头 + 复数系数（实部+虚部）
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(f"# 功放表征拟合系数导出\n")
+                    f.write(f"# 模型类型, {short} ({modType})\n")
+                    f.write(f"# memLen, {memLen}\n")
+                    f.write(f"# degLen, {degLen}\n")
+                    f.write(f"# 系数矩阵维度, {C.shape[0]} x {C.shape[1]}\n")
+                    f.write(f"# 数据文件, {self.e_file.text()}\n")
+                    f.write("# 格式: 每个系数为 real+imagj\n")
+                    for row in C:
+                        f.write(",".join(f"{v.real:.8e}{v.imag:+.8e}j"
+                                          for v in row) + "\n")
+            QMessageBox.information(self, "导出成功", f"已导出：\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+
     def _save(self):
-        key  = self._key() or "pa"
         path, _ = QFileDialog.getSaveFileName(
-            self, "保存图像", f"PA_{key}.png",
+            self, "保存图像", "PA_characterization.png",
             "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)")
         if path:
             self.canvas.save(path)
