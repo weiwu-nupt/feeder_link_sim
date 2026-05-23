@@ -154,8 +154,7 @@ def load_pa_data(mat_path: str) -> PAData:
     import scipy.io as sio
     m = sio.loadmat(mat_path)
     if "results" not in m:
-        raise ValueError("文件中缺少 results 结构体，"
-                          "请选择 helperPACharSavedData*MHz.mat 文件")
+        raise ValueError("文件中缺少 results 结构体")
     r = m["results"][0, 0]
 
     def fld(name):
@@ -298,6 +297,83 @@ def mp_error_measure(x, y, coefMat, modType):
 
 
 # ══════════════════════════════════════════════════════════
+#  频谱估计  (等效 MATLAB spectrumAnalyzer 'Power' 谱)
+# ══════════════════════════════════════════════════════════
+
+def estimate_spectrum(x, sample_rate, nfft=1024, ref_load=100.0,
+                      noise_floor_dbm=None):
+    """
+    Welch 平均功率谱，输出单位 dBm（参考阻抗负载 ref_load Ω）。
+
+    与 MATLAB spectrumAnalyzer 一致：
+      - 1024 点分段、Hann 窗、50% 交叠、分段平均
+      - 'Power' 谱：各频点为该 RBW 频带内的功率
+      - 全谱功率之和 = 信号平均功率  P = mean(|x|^2)/R
+
+    noise_floor_dbm:
+      若给定，则向信号叠加复高斯测量噪声，使带外噪声地板落在该电平。
+      数据文件保存的波形为理想表征信号（带外可低至 -110 dBm），
+      真实频谱分析仪受热噪声/量化限制有 ~-77 dBm 地板；
+      叠加等效噪声使显示与 MATLAB spectrumAnalyzer 一致。
+      带内信号泄漏（裙边）仍由信号自身决定，不受影响。
+
+    返回 (freq_MHz, power_dBm)
+    """
+    from numpy.fft import fft, fftshift, fftfreq
+    x = np.asarray(x).ravel()
+    nfft = min(nfft, len(x))
+
+    # 叠加等效测量噪声地板
+    if noise_floor_dbm is not None:
+        p_bin_w = 10 ** (noise_floor_dbm / 10.0) * 1e-3   # 每频点噪声功率 (W)
+        sigma = np.sqrt(p_bin_w * nfft * ref_load)        # 复噪声标准差
+        rng = np.random.RandomState(12345)                # 可复现
+        noise = (rng.randn(len(x)) + 1j * rng.randn(len(x)))
+        x = x + noise / np.sqrt(2) * sigma
+
+    win = np.hanning(nfft)
+    step = nfft // 2
+    acc = np.zeros(nfft)
+    cnt = 0
+    for i in range(0, len(x) - nfft + 1, step):
+        seg = x[i:i + nfft] * win
+        acc += np.abs(fftshift(fft(seg))) ** 2
+        cnt += 1
+    if cnt == 0:
+        acc = np.abs(fftshift(fft(x[:nfft] * win[:len(x)]))) ** 2
+        cnt = 1
+    P = acc / cnt
+    # 归一化：全谱之和 = 平均功率 mean(|x|^2)
+    Pbin = P / np.sum(P) * np.mean(np.abs(x) ** 2)
+    power_dbm = 10 * np.log10(Pbin / ref_load / 1e-3 + 1e-30)
+    freq_mhz = fftshift(fftfreq(nfft, 1.0 / sample_rate)) / 1e6
+    return freq_mhz, power_dbm
+
+
+def channel_power_dbm(freq_mhz, power_dbm, bw_hz, ref_load=100.0):
+    """在 ±bw/2 频带内积分得到信道功率 (dBm)。"""
+    band = np.abs(freq_mhz) <= (bw_hz / 2e6)
+    p_lin = 10 ** (power_dbm[band] / 10.0) * 1e-3
+    return 10 * np.log10(np.sum(p_lin) / 1e-3 + 1e-30)
+
+
+def estimate_occupied_bw(freq_mhz, power_dbm, frac=0.99):
+    """
+    由功率谱估计占用带宽 (Hz)：包含总功率 frac 比例的最窄中心频带。
+    用于文件名未给出带宽时的回退估计。
+    """
+    p_lin = 10 ** (power_dbm / 10.0)
+    total = np.sum(p_lin)
+    # 以中心频点向两侧累积
+    order = np.argsort(np.abs(freq_mhz))
+    cum = np.cumsum(p_lin[order])
+    idx = np.searchsorted(cum, frac * total)
+    idx = min(idx, len(order) - 1)
+    bw_mhz = 2.0 * np.abs(freq_mhz[order[idx]])
+    return bw_mhz * 1e6
+
+
+# ══════════════════════════════════════════════════════════
 #  解析工具
 # ══════════════════════════════════════════════════════════
 
@@ -366,7 +442,7 @@ def _form_row(form, label, default, hint="", w=140):
 # ══════════════════════════════════════════════════════════
 
 class PAModelDialog(ModuleDialog):
-    TITLE        = "功放表征"
+    TITLE        = "功放"
     ACCENT_COLOR = "#BA7517"
     MIN_WIDTH    = 1040
     MIN_HEIGHT   = 700
@@ -377,12 +453,16 @@ class PAModelDialog(ModuleDialog):
         ("Cross-Term Memory (CM)",        "ctMemPoly"),
     ]
 
+    # 记忆多项式参数（与 MATLAB PowerAmplifierCharacterizationExample 一致）
+    MEM_LEN = 5     # memLen 记忆长度
+    DEG_LEN = 5     # degLen 多项式阶数
+
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.pa_data = None      # PAData
-        self.tx_waveform = None  # 生成的 OFDM
         self.coef_mat = None     # fitCoefMatMem
         self.last_modType = None
+        self.pa_output_fit = None  # 模型拟合输出 paOutputFitMem
 
     # ──────────────────────────────────────────────────────
     def build_content(self, layout: QVBoxLayout):
@@ -405,9 +485,9 @@ class PAModelDialog(ModuleDialog):
         fl = QHBoxLayout(); fl.setSpacing(6)
         self.e_file = QLineEdit(); self.e_file.setReadOnly(True)
         self.e_file.setStyleSheet(_ES)
-        self.e_file.setPlaceholderText("helperPACharSavedData100MHz.mat")
+        self.e_file.setPlaceholderText("")
         btn_browse = QPushButton("浏览…")
-        btn_browse.setFixedWidth(64); btn_browse.setFixedHeight(28)
+        btn_browse.setFixedWidth(70); btn_browse.setFixedHeight(28)
         btn_browse.setStyleSheet(
             "QPushButton{background:#FFF;color:#444;border:1px solid #CCC;"
             "border-radius:4px;font-size:9pt;}"
@@ -422,29 +502,33 @@ class PAModelDialog(ModuleDialog):
         dg.layout().addLayout(df)
         lv.addWidget(dg)
 
-        # ── ② OFDM 测试波形 ───────────────────────────────
-        og = _group("② OFDM 测试波形")
-        of = QFormLayout(); of.setSpacing(5); of.setContentsMargins(0, 0, 0, 0)
-        ol = QLabel("信道带宽"); ol.setStyleSheet(_LS)
-        self.combo_bw = QComboBox()
-        self.combo_bw.setStyleSheet(
-            "QComboBox{background:#FFF;border:1px solid #D0D0D0;"
-            "border-radius:3px;padding:3px 8px;font-size:10pt;color:#111;}"
-            "QComboBox QAbstractItemView{background:#FFF;border:1px solid #D0D0D0;"
-            "color:#111;selection-background-color:#FAEEDA;font-size:10pt;}")
-        for s in ["5 MHz", "15 MHz", "40 MHz", "100 MHz"]:
-            self.combo_bw.addItem(s)
-        self.combo_bw.setCurrentIndex(3)
-        of.addRow(ol, self.combo_bw)
-        og.layout().addLayout(of)
-        self.btn_ofdm = QPushButton("生成 OFDM 并绘制 AM/AM、Gain")
-        self.btn_ofdm.setFixedHeight(30)
-        self.btn_ofdm.setStyleSheet(
+        # ── ② 实测特性曲线 ─────────────────────────────────
+        og = _group("② 实测特性曲线")
+
+        _plot_btn_style = (
             "QPushButton{background:#FFF;color:#BA7517;border:1px solid #BA7517;"
             "border-radius:5px;font-size:9.5pt;font-weight:bold;}"
-            "QPushButton:hover{background:#FAEEDA;}")
-        self.btn_ofdm.clicked.connect(self._run_characterize)
-        og.layout().addWidget(self.btn_ofdm)
+            "QPushButton:hover{background:#FAEEDA;}"
+            "QPushButton:disabled{color:#BBB;border-color:#DDD;}")
+
+        self.btn_spec_in = QPushButton("绘制输入频谱")
+        self.btn_spec_in.setFixedHeight(30)
+        self.btn_spec_in.setStyleSheet(_plot_btn_style)
+        self.btn_spec_in.clicked.connect(self._plot_input_spectrum)
+        og.layout().addWidget(self.btn_spec_in)
+
+        bb = QHBoxLayout(); bb.setSpacing(8)
+        self.btn_amam = QPushButton("绘制 AM/AM")
+        self.btn_amam.setFixedHeight(30)
+        self.btn_amam.setStyleSheet(_plot_btn_style)
+        self.btn_amam.clicked.connect(self._plot_amam)
+        bb.addWidget(self.btn_amam)
+        self.btn_gain_meas = QPushButton("绘制 Gain")
+        self.btn_gain_meas.setFixedHeight(30)
+        self.btn_gain_meas.setStyleSheet(_plot_btn_style)
+        self.btn_gain_meas.clicked.connect(self._plot_gain_meas)
+        bb.addWidget(self.btn_gain_meas)
+        og.layout().addLayout(bb)
         lv.addWidget(og)
 
         # ── ③ 拟合模型 ────────────────────────────────────
@@ -452,24 +536,15 @@ class PAModelDialog(ModuleDialog):
         mf = QFormLayout(); mf.setSpacing(5); mf.setContentsMargins(0, 0, 0, 0)
         ml = QLabel("模型类型"); ml.setStyleSheet(_LS)
         self.combo_model = QComboBox()
-        self.combo_model.setStyleSheet(self.combo_bw.styleSheet())
+        self.combo_model.setStyleSheet(
+            "QComboBox{background:#FFF;border:1px solid #D0D0D0;"
+            "border-radius:3px;padding:3px 8px;font-size:10pt;color:#111;}"
+            "QComboBox QAbstractItemView{background:#FFF;border:1px solid #D0D0D0;"
+            "color:#111;selection-background-color:#FAEEDA;font-size:10pt;}")
         for name, _ in self._MODELS:
             self.combo_model.addItem(name)
         mf.addRow(ml, self.combo_model)
         mg.layout().addLayout(mf)
-
-        note = QLabel(
-            "MP : y(n)=ΣΣ C[m,d]·x(n-m)·|x(n-m)|^d\n"
-            "CM : 含所有延迟时刻的包络交叉项\n"
-            "memLen=记忆长度  degLen=多项式阶数")
-        note.setStyleSheet("font-size:8pt;color:#666;padding:2px 0;")
-        note.setWordWrap(True)
-        mg.layout().addWidget(note)
-
-        pf = QFormLayout(); pf.setSpacing(5); pf.setContentsMargins(0, 0, 0, 0)
-        self.e_memlen = _form_row(pf, "memLen 记忆长度:", "5", "", 60)
-        self.e_deglen = _form_row(pf, "degLen 多项式阶数:", "5", "", 60)
-        mg.layout().addLayout(pf)
 
         self.btn_fit = QPushButton("拟合模型并绘制 Gain 对比")
         self.btn_fit.setFixedHeight(32)
@@ -479,10 +554,21 @@ class PAModelDialog(ModuleDialog):
             "QPushButton:hover{background:#8B5A0F;}")
         self.btn_fit.clicked.connect(self._run_fit)
         mg.layout().addWidget(self.btn_fit)
+
+        self.btn_spec = QPushButton("查看功放输出频谱对比")
+        self.btn_spec.setFixedHeight(30)
+        self.btn_spec.setEnabled(False)
+        self.btn_spec.setStyleSheet(
+            "QPushButton{background:#FFF;color:#BA7517;border:1px solid #BA7517;"
+            "border-radius:5px;font-size:9.5pt;font-weight:bold;}"
+            "QPushButton:hover{background:#FAEEDA;}"
+            "QPushButton:disabled{color:#BBB;border-color:#DDD;}")
+        self.btn_spec.clicked.connect(self._show_output_spectrum)
+        mg.layout().addWidget(self.btn_spec)
         lv.addWidget(mg)
 
         # ── ④ 拟合系数 / 导出 ─────────────────────────────
-        cg = _group("④ 拟合系数 fitCoefMatMem")
+        cg = _group("④ 拟合系数")
         self.txt_coef = QPlainTextEdit()
         self.txt_coef.setReadOnly(True)
         self.txt_coef.setFixedHeight(110)
@@ -530,13 +616,16 @@ class PAModelDialog(ModuleDialog):
     def _browse_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "选择功放数据文件", "",
-            "MAT 文件 (*.mat);;所有文件 (*)")
+            "所有文件(*)")
         if not path:
             return
         try:
             self.pa_data = load_pa_data(path)
         except Exception as e:
-            QMessageBox.critical(self, "加载失败", str(e))
+            # 解析失败：直接报错
+            QMessageBox.critical(self, "加载失败",
+                                 f"无法解析该文件：\n{e}")
+            self.pa_data = None
             return
 
         d = self.pa_data
@@ -549,88 +638,137 @@ class PAModelDialog(ModuleDialog):
                 + (f"  |  带宽: {d.bw/1e6:.0f} MHz" if d.bw else ""))
         self.lbl_datainfo.setText(info)
         self.lbl_datainfo.setStyleSheet("font-size:8.5pt;color:#3A7D44;")
-        # 同步带宽下拉
-        if d.bw:
-            for i, s in enumerate(["5 MHz", "15 MHz", "40 MHz", "100 MHz"]):
-                if abs(float(s.split()[0]) * 1e6 - d.bw) < 1:
-                    self.combo_bw.setCurrentIndex(i)
-        self.status.setText("数据已加载 — 可生成 OFDM 并绘制曲线")
-        # 自动绘制实测特性
-        self._run_characterize()
-
-    def _bw_value(self):
-        return float(self.combo_bw.currentText().split()[0]) * 1e6
+        self.status.setText("数据已加载 — 可绘制频谱 / AM/AM / Gain 曲线")
+        # 自动绘制 PA Input 频谱
+        self._plot_input_spectrum()
 
     # ──────────────────────────────────────────────────────
-    #  ② / ③ 实测特性绘制
+    #  ② 实测特性曲线 — 三个独立绘图
     # ──────────────────────────────────────────────────────
-    def _run_characterize(self):
+    def _check_data(self):
         if self.pa_data is None:
             QMessageBox.information(self, "提示", "请先加载功放数据文件")
+            return False
+        return True
+
+    def _plot_input_spectrum(self):
+        """绘制 PA Input 频谱（仿 MATLAB spectrumAnalyzer 暗色风格）。"""
+        if not self._check_data():
             return
         try:
-            self.status.setText("生成 OFDM 测试波形…")
-            QWidget.repaint(self)
-            bw = self._bw_value()
-            tx, sr, nf = generate_ofdm(bw)
-            self.tx_waveform = tx
-            self._plot_characterization()
+            d = self.pa_data
+            x = d.input_wave
+            sr = d.sample_rate or 1.0
+
+            # 叠加 -77 dBm 等效测量噪声地板，与 MATLAB spectrumAnalyzer 一致
+            freq, pdbm = estimate_spectrum(x, sr, noise_floor_dbm=-77.0)
+            # 带宽：优先用文件名推断值，否则由频谱估计占用带宽
+            bw = d.bw if d.bw else estimate_occupied_bw(freq, pdbm)
+            ch_pwr = channel_power_dbm(freq, pdbm, bw)
+            band_mhz = bw / 2e6
+
+            DARK = "#1A1A1A"
+            fig = self.canvas.fig
+            fig.clf()
+            fig.set_constrained_layout(True)
+            fig.patch.set_facecolor(DARK)
+            ax = fig.subplots(1, 1)
+            ax.set_facecolor(DARK)
+
+            # 占用带宽高亮（半透明）+ 虚线边界
+            ax.axvspan(-band_mhz, band_mhz, color="#C9A227", alpha=0.22)
+            ax.axvline(-band_mhz, color="#E0C040", ls="--", lw=1.0)
+            ax.axvline(band_mhz, color="#E0C040", ls="--", lw=1.0)
+
+            ax.plot(freq, pdbm, color="#E8C84C", lw=1.0, label="PA Input")
+
+            ax.set_xlim(freq[0], freq[-1])
+            ax.set_ylim(-100, 30)
+            ax.set_xlabel("频率 (MHz)", color="#DDDDDD", fontsize=10)
+            ax.set_ylabel("功率 (dBm)", color="#DDDDDD", fontsize=10)
+            ax.set_title(
+                f"PA Input 频谱  |  信道功率 ≈ {ch_pwr:.2f} dBm  |  "
+                f"占用带宽 ≈ {bw/1e6:.0f} MHz",
+                color="#EEEEEE", fontsize=10)
+            ax.tick_params(colors="#BBBBBB", labelsize=9)
+            ax.grid(True, color="#3C3C3C", lw=0.5)
+            for s in ax.spines.values():
+                s.set_color("#555555")
+            leg = ax.legend(loc="upper left", facecolor=DARK,
+                            edgecolor="#555555", fontsize=9)
+            for t in leg.get_texts():
+                t.set_color("#E8C84C")
+
+            self.canvas.draw()
             self.status.setText(
-                f"OFDM 已生成: {len(tx)} 点 @ {sr/1e6:.1f} MHz, "
-                f"{nf} 帧  |  已绘制实测 AM/AM 与 Gain 曲线")
+                f"PA Input 频谱  |  信道功率 ≈ {ch_pwr:.2f} dBm")
         except Exception as e:
             import traceback; traceback.print_exc()
-            QMessageBox.critical(self, "错误", str(e))
+            QMessageBox.critical(self, "绘图错误", str(e))
 
-    def _plot_characterization(self):
-        """绘制实测 AM/AM 与 Gain vs Input Power（上 OFDM 频谱，下 AM/AM+Gain）。"""
-        d = self.pa_data
-        refP = d.reference_power
-        amam = d.measured_amam
+    def _plot_amam(self):
+        """绘制实测 AM/AM 特性（输入功率 vs 输出功率）。"""
+        if not self._check_data():
+            return
+        try:
+            d = self.pa_data
+            refP = d.reference_power      # 输入功率 (dBm)
+            amam = d.measured_amam        # AM/AM 增益测量 (dB)
 
-        fig = self.canvas.fig
-        fig.clf()
-        fig.set_constrained_layout(True)
-        ax1, ax2, ax3 = fig.subplots(3, 1)
-        fig.patch.set_facecolor("#F8F8F8")
+            fig = self.canvas.fig
+            fig.clf()
+            fig.set_constrained_layout(True)
+            fig.patch.set_facecolor("#F8F8F8")
+            ax = fig.subplots(1, 1)
+            ax.set_facecolor("#FFFFFF")
 
-        # — OFDM 输入频谱（PA Input）—
-        ax1.set_facecolor("#FFFFFF")
-        x = self.tx_waveform
-        sr = d.sample_rate or 1.0
-        win = np.hanning(len(x))
-        X = np.fft.fftshift(np.fft.fft(x * win))
-        psd = 20 * np.log10(np.abs(X) / np.max(np.abs(X)) + 1e-12)
-        freq = np.fft.fftshift(np.fft.fftfreq(len(x), 1 / sr)) / 1e6
-        ax1.plot(freq, psd, color="#0055CC", lw=0.7)
-        ax1.set_xlabel("频率 (MHz)", fontsize=9)
-        ax1.set_ylabel("归一化功率 (dB)", fontsize=9)
-        ax1.set_title("OFDM 测试波形频谱 (PA Input)", fontsize=10)
-        ax1.set_ylim([-100, 5])
-        ax1.grid(True, color="#E8E8E8", lw=0.5)
-
-        # — AM/AM —
-        ax2.set_facecolor("#FFFFFF")
-        ax2.plot(refP, refP + amam, ".", color="#0055CC", ms=2)
-        ax2.set_xlabel("输入功率 (dBm)", fontsize=9)
-        ax2.set_ylabel("输出功率 (dBm)", fontsize=9)
-        ax2.set_title("AM/AM 实测特性", fontsize=10)
-        ax2.grid(True, color="#E8E8E8", lw=0.5)
-
-        # — Gain vs Input Power —
-        ax3.set_facecolor("#FFFFFF")
-        ax3.plot(refP, amam, ".", color="#CC2200", ms=2)
-        ax3.set_xlabel("输入功率 (dBm)", fontsize=9)
-        ax3.set_ylabel("增益 (dB)", fontsize=9)
-        ax3.set_title("Gain vs Input Power 实测特性", fontsize=10)
-        ax3.grid(True, color="#E8E8E8", lw=0.5)
-
-        for ax in (ax1, ax2, ax3):
+            # 输出功率 = 输入功率 + AM/AM 增益（对应 helperPACharPlotSpecAnAMAM）
+            ax.plot(refP, refP + amam, ".", color="#0055CC", ms=3)
+            ax.set_xlabel("Input Power (dBm)", fontsize=10)
+            ax.set_ylabel("Output Power (dBm)", fontsize=10)
+            ax.set_title("AM/AM 实测特性", fontsize=11)
+            ax.grid(True, color="#E8E8E8", lw=0.6)
             for s in ax.spines.values():
                 s.set_color("#CCCCCC")
-            ax.tick_params(labelsize=8)
+            ax.tick_params(labelsize=9)
 
-        self.canvas.draw()
+            self.canvas.draw()
+            self.status.setText("已绘制 AM/AM 实测特性")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "绘图错误", str(e))
+
+    def _plot_gain_meas(self):
+        """绘制实测 Gain vs Input Power 特性。"""
+        if not self._check_data():
+            return
+        try:
+            d = self.pa_data
+            refP = d.reference_power      # 输入功率 (dBm)
+            amam = d.measured_amam        # 增益 (dB)
+
+            fig = self.canvas.fig
+            fig.clf()
+            fig.set_constrained_layout(True)
+            fig.patch.set_facecolor("#F8F8F8")
+            ax = fig.subplots(1, 1)
+            ax.set_facecolor("#FFFFFF")
+
+            # 对应 helperPACharPlotSpecAnGain
+            ax.plot(refP, amam, ".", color="#CC2200", ms=3)
+            ax.set_xlabel("Input Power (dBm)", fontsize=10)
+            ax.set_ylabel("Gain (dB)", fontsize=10)
+            ax.set_title("Gain vs Input Power 实测特性", fontsize=11)
+            ax.grid(True, color="#E8E8E8", lw=0.6)
+            for s in ax.spines.values():
+                s.set_color("#CCCCCC")
+            ax.tick_params(labelsize=9)
+
+            self.canvas.draw()
+            self.status.setText("已绘制 Gain vs Input Power 实测特性")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.critical(self, "绘图错误", str(e))
 
     # ──────────────────────────────────────────────────────
     #  ④ 模型拟合
@@ -651,8 +789,8 @@ class PAModelDialog(ModuleDialog):
         paOutput = d.output_wave
 
         modType = self._MODELS[self.combo_model.currentIndex()][1]
-        memLen = max(1, _i(self.e_memlen.text(), 5))
-        degLen = max(1, _i(self.e_deglen.text(), 5))
+        memLen = self.MEM_LEN
+        degLen = self.DEG_LEN
 
         self.status.setText("拟合记忆多项式系数…")
         QWidget.repaint(self)
@@ -673,12 +811,13 @@ class PAModelDialog(ModuleDialog):
 
         # —— 由模型生成拟合输出 paOutputFitMem ——
         paOutputFit = mp_signal_generator(paInput, coefMat, modType)
+        self.pa_output_fit = paOutputFit      # 缓存供频谱对比使用
 
         # —— 显示系数矩阵 abs(fitCoefMatMem) ——
         absC = np.abs(coefMat)
         lines = [f"模型: {modType}   memLen={memLen}  degLen={degLen}",
                  f"系数矩阵维度: {coefMat.shape[0]} × {coefMat.shape[1]}",
-                 "abs(fitCoefMatMem):"]
+                 "模型系数:"]
         for row in absC:
             lines.append("  " + "  ".join(f"{v:9.4f}" for v in row))
         lines.append(f"时域 RMS 误差: {rmsErr:.4f} %")
@@ -686,8 +825,11 @@ class PAModelDialog(ModuleDialog):
         lines.append("    系数解非唯一；增益曲线与RMS误差为准。")
         self.txt_coef.setPlainText("\n".join(lines))
 
+        self._last_rms = rmsErr
+
         # —— 绘制 Gain 拟合对比 (helperPACharPlotGain) ——
         self._plot_gain(paInput, paOutput, paOutputFit, modType, rmsErr)
+        self.btn_spec.setEnabled(True)
 
         short = "MP" if modType == "memPoly" else "CM"
         self.status.setText(
@@ -767,6 +909,65 @@ class PAModelDialog(ModuleDialog):
         self.canvas.draw()
 
     # ──────────────────────────────────────────────────────
+    #  功放输出频谱对比
+    # ──────────────────────────────────────────────────────
+    def _show_output_spectrum(self):
+        """
+        绘制功放输出频谱对比（仿 MATLAB spectrumAnalyzer 暗色风格）：
+          Actual PA Output         — 蓝色，实测功放输出
+          Memory Polynomial Output — 黄色，记忆多项式模型拟合输出
+        可观察模型对带外频谱再生（spectral regrowth）的拟合程度。
+        """
+        if getattr(self, "pa_output_fit", None) is None:
+            QMessageBox.information(self, "提示", "请先完成模型拟合")
+            return
+        d = self.pa_data
+        sr = d.sample_rate or 1.0
+        modType = self.last_modType
+        short = "MP" if modType == "memPoly" else "CM"
+
+        # 叠加 -77 dBm 等效测量噪声地板（与 PA Input 频谱一致）
+        freq, p_act = estimate_spectrum(d.output_wave, sr,
+                                        noise_floor_dbm=-77.0)
+        _,    p_fit = estimate_spectrum(self.pa_output_fit, sr,
+                                        noise_floor_dbm=-77.0)
+
+        DARK = "#1A1A1A"
+        fig = self.canvas.fig
+        fig.clf()
+        fig.set_constrained_layout(True)
+        fig.patch.set_facecolor(DARK)
+        ax = fig.subplots(1, 1)
+        ax.set_facecolor(DARK)
+
+        ax.plot(freq, p_act, color="#3B8FE0", lw=1.0,
+                label="Actual PA Output")
+        ax.plot(freq, p_fit, color="#E8C84C", lw=1.0,
+                label=f"{short} Model Output")
+
+        ax.set_xlim(freq[0], freq[-1])
+        ax.set_ylim(-80, 30)
+        ax.set_xlabel("频率 (MHz)", color="#DDDDDD", fontsize=10)
+        ax.set_ylabel("功率 (dBm)", color="#DDDDDD", fontsize=10)
+        ax.set_title(
+            f"功放输出频谱对比 — 实测 vs {short} 模型拟合  "
+            f"（时域 RMS 误差 = {getattr(self, '_last_rms', 0):.3f}%）",
+            color="#EEEEEE", fontsize=10)
+        ax.tick_params(colors="#BBBBBB", labelsize=9)
+        ax.grid(True, color="#3C3C3C", lw=0.5)
+        for s in ax.spines.values():
+            s.set_color("#555555")
+        leg = ax.legend(loc="upper left", facecolor=DARK,
+                        edgecolor="#555555", fontsize=9)
+        for t in leg.get_texts():
+            t.set_color("#DDDDDD")
+
+        self.canvas.draw()
+        self.status.setText(
+            f"{short} 模型输出频谱对比  |  "
+            f"可观察带外频谱再生 (spectral regrowth) 的拟合程度")
+
+    # ──────────────────────────────────────────────────────
     #  导出
     # ──────────────────────────────────────────────────────
     def _export(self):
@@ -781,9 +982,9 @@ class PAModelDialog(ModuleDialog):
         try:
             modType = self.last_modType
             short = "MP" if modType == "memPoly" else "CM"
-            memLen = max(1, _i(self.e_memlen.text(), 5))
-            degLen = max(1, _i(self.e_deglen.text(), 5))
             C = self.coef_mat
+            memLen = self.MEM_LEN
+            degLen = self.DEG_LEN
 
             if path.endswith(".npz"):
                 np.savez(path, fitCoefMatMem=C, modType=modType,
@@ -791,7 +992,7 @@ class PAModelDialog(ModuleDialog):
             else:
                 # CSV / TXT：写参数头 + 复数系数（实部+虚部）
                 with open(path, "w", encoding="utf-8") as f:
-                    f.write(f"# 功放表征拟合系数导出\n")
+                    f.write(f"# 功放拟合系数导出\n")
                     f.write(f"# 模型类型, {short} ({modType})\n")
                     f.write(f"# memLen, {memLen}\n")
                     f.write(f"# degLen, {degLen}\n")

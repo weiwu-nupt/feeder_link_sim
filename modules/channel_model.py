@@ -369,98 +369,73 @@ class RainPlotDialog(QDialog):
         lv.addLayout(bhl)
 
     def _plot(self):
-        """
-        横轴：R001 从 0.1 扫到 max_R（200 点连续曲线）
-        每个 R001 值重新算 L_eff（P.618-14 完整路径公式），再乘 γ_R(R001) 得 A(0.01%)。
-        5 个超越概率散点叠加（对应当前城市的 R_p, A_p）。
-        """
-        from modules.rain_attenuation import (
-            calc_specific_attenuation,
-            calc_effective_path_length,
-            scale_attenuation_by_probability,
-        )
+        from modules.rain_attenuation import calc_specific_attenuation, calc_effective_path_length
+        from modules.cross_polarization import calc_xpd_rain
         import numpy as np
 
         s   = self._stats
         fig = self.canvas.figure
         fig.clf()
         fig.set_constrained_layout(True)
-        ax  = fig.add_subplot(111)
-        ax.set_facecolor("#FAFCFF")
+        ax_a = fig.add_subplot(111)
+        ax_x = ax_a.twinx()
+        ax_a.set_facecolor("#FAFCFF")
         fig.patch.set_facecolor("#F4F6F8")
 
-        # ── 横轴范围：从 0.1 到 max_R ────────────────────────
         max_R = max(max(s.R_p_vals) * 1.4, 50.0)
         R_arr = np.linspace(0.1, max_R, 200)
+        A_curve   = np.zeros_like(R_arr)
+        XPD_curve = np.zeros_like(R_arr)
 
-        # ── 连续曲线：每个 R 值视为"假想的 R001"，
-        #    重新计算 L_eff 和 A(R) = γ_R(R) * L_eff(R)
-        #    这样曲线呈现 A 随 R001 的非线性变化，
-        #    5 个散点正好落在曲线上（A_p 都是从 A(0.01%) 外推的）
-        A_curve = np.zeros_like(R_arr)
         for i, R in enumerate(R_arr):
             g_arr, _, _ = calc_specific_attenuation(
                 s.freq_ghz, np.array([R]), s.elevation_deg, 45.0)
             gamma_i = float(g_arr[0])
             L = calc_effective_path_length(
-                s.rain_height_km, 0.0, s.elevation_deg, float(R), s.lat,
-                freq_ghz=s.freq_ghz, gamma_R=gamma_i)
-            A_curve[i] = gamma_i * L
+                s.rain_height_km, 0.0, s.elevation_deg, s.freq_ghz, np.array([R]))
+            A_i = gamma_i * float(L[0]) if hasattr(L, "__len__") else gamma_i * float(L)
+            A_curve[i] = A_i
+            xpd_res = calc_xpd_rain(A_i, s.freq_ghz, s.elevation_deg,
+                                     tau_deg=45.0, sigma_deg=5.0)
+            XPD_curve[i] = xpd_res["XPD_rain"]
 
-        # ── 绘制主曲线 ───────────────────────────────────────
-        ax.plot(R_arr, A_curve, color="#CC2200", lw=2.0, zorder=3,
-                label=f"A(0.01%) = γ_R × L_eff(R)")
+        l1, = ax_a.plot(R_arr, A_curve, color="#CC2200", lw=2.0, zorder=3,
+                        label="A (dB)")
+        ax_a.axvline(s.R001, color="#999999", lw=1.0, ls="--", zorder=2)
+        l2, = ax_x.plot(R_arr, XPD_curve, color="#0055CC", lw=2.0,
+                        ls="-.", zorder=3, label="XPD (dB)")
 
-        # ── 5 个超越概率散点 ──────────────────────────────────
-        # 注意：A_p_vals[1] = A(0.01%)，其余由式8外推，
-        # 故只有 p=0.01% 的点严格在曲线上；其余散点在曲线上下，
-        # 体现不同超越概率对应相同 R001 下的衰减差异，
-        # 用不同 R_p 定位横轴位置（R_p 是反推的降雨强度）
-        # pt_colors = ["#0055CC","#1D9E75","#E57C00","#7B3FA0","#CC0000"]
-        # for i, (p, R_p, A_p) in enumerate(
-        #         zip(s.probabilities, s.R_p_vals, s.A_p_vals)):
-        #     if R_p <= 0:
-        #         continue
-        #     clr = pt_colors[i]
-        #     ax.plot(R_p, A_p, "o", color=clr, ms=9,
-        #             markeredgecolor="white", markeredgewidth=0.8,
-        #             zorder=5)
-        #     # 标注位置：左侧点往右偏，右侧点往左偏
-        #     ha   = "left"  if R_p < max_R * 0.72 else "right"
-        #     xoff = 8 if ha == "left" else -8
-        #     ax.annotate(
-        #         f"p={p}%\nR={R_p:.1f} mm/h\nA={A_p:.2f} dB",
-        #         xy=(R_p, A_p),
-        #         xytext=(xoff, 10),
-        #         textcoords="offset points",
-        #         ha=ha, va="bottom", fontsize=8, color=clr,
-        #         bbox=dict(boxstyle="round,pad=0.3", fc="white",
-        #                   ec=clr, alpha=0.90, lw=0.9),
-        #         arrowprops=dict(arrowstyle="-",
-        #                         color=clr, lw=0.8, alpha=0.6),
-        #         zorder=6)
+        ax_a.set_xlim(0, max_R)
+        y_top = max(A_curve) * 1.18
+        ax_a.set_ylim(0, y_top)
+        ax_a.set_xlabel("R (mm/h)", fontsize=11)
+        ax_a.set_ylabel("A (dB)", fontsize=11, color="#CC2200")
+        ax_a.tick_params(axis="y", labelcolor="#CC2200", labelsize=9.5)
+        ax_a.tick_params(axis="x", labelsize=9.5)
 
-        # ── 标注 R001 参考线 ──────────────────────────────────
-        ax.axvline(s.R001, color="#888888", lw=1.0, ls="--", zorder=2,
-                   label=f"R_0.01 = {s.R001:.1f} mm/h")
+        xpd_valid = XPD_curve[np.isfinite(XPD_curve)]
+        xpd_lo = max(0, float(np.min(xpd_valid)) - 3) if len(xpd_valid) else 0
+        xpd_hi = min(80, float(np.max(xpd_valid)) + 5) if len(xpd_valid) else 40
+        ax_x.set_ylim(xpd_lo, xpd_hi)
+        ax_x.set_ylabel("XPD (dB)", fontsize=11, color="#0055CC")
+        ax_x.tick_params(axis="y", labelcolor="#0055CC", labelsize=9.5)
+        ax_x.spines["right"].set_color("#0055CC")
+        ax_a.spines["left"].set_color("#CC2200")
+        for sp in ["top", "bottom"]:
+            ax_a.spines[sp].set_color("#CCCCCC")
+            ax_x.spines[sp].set_visible(False)
+        ax_x.spines["left"].set_visible(False)
+        ax_a.grid(True, color="#E4E8EE", lw=0.6, zorder=1)
 
-        # ── 轴、网格、标题 ───────────────────────────────────
-        ax.set_xlim(0, max_R)
-        y_top = max(A_curve) * 1.15
-        ax.set_ylim(0, y_top)
-        ax.set_xlabel("降雨强度 R (mm/h)", fontsize=11)
-        ax.set_ylabel("链路雨衰 A (dB)", fontsize=11)
-        ax.set_title(
-            f"{s.city}  f = {s.freq_ghz} GHz  θ = {s.elevation_deg}°  "
-            f"H_R = {s.rain_height_km} km  R_0.01 = {s.R001:.1f} mm/h",
-            fontsize=10, pad=10)
-        # ax.legend(fontsize=9, loc="upper left",
-        #           framealpha=0.93, edgecolor="#CCCCCC")
-        ax.grid(True, color="#E4E8EE", lw=0.6, zorder=1)
-        for sp in ax.spines.values():
-            sp.set_color("#CCCCCC"); sp.set_linewidth(0.8)
-        ax.tick_params(labelsize=9.5)
-
+        handles = [l1, l2,
+                   plt.Line2D([0],[0], color="#999", lw=1, ls="--",
+                               label=f"R_0.01={s.R001:.1f} mm/h")]
+        ax_a.legend(handles=handles, fontsize=9, loc="upper left",
+                    framealpha=0.93, edgecolor="#CCC")
+        ax_a.set_title(
+            f"{s.city}  f={s.freq_ghz} GHz  θ={s.elevation_deg}°  "
+            f"H_R={s.rain_height_km} km  R_0.01={s.R001:.1f} mm/h",
+            fontsize=10, pad=8)
         self.canvas.draw()
     def _save(self):
         city = self._stats.city or "rain"
@@ -473,6 +448,129 @@ class RainPlotDialog(QDialog):
 # ══════════════════════════════════════════════════════════
 #  主 Widget
 # ══════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════
+#  群时延图对话框
+# ══════════════════════════════════════════════════════════
+
+class GroupDelayDialog(QDialog):
+    """
+    电离层群时延随频率变化曲线。
+    t(f) = 1.345e-7 * N_T / f^2  (s)，换算为 ns。
+    横轴：频率 (GHz)，由中心频率和带宽确定范围。
+    """
+
+    def __init__(self, N_T=1e17, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("电离层群时延")
+        self.setMinimumSize(640, 500)
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowMinimizeButtonHint |
+            Qt.WindowType.WindowMaximizeButtonHint |
+            Qt.WindowType.WindowCloseButtonHint)
+        self._N_T = N_T
+        self._build_ui()
+        self._plot()
+
+    def _build_ui(self):
+        lv = QVBoxLayout(self)
+        lv.setContentsMargins(8, 8, 8, 8)
+        lv.setSpacing(6)
+
+        # 控制栏
+        ctrl = QHBoxLayout(); ctrl.setSpacing(8)
+        ctrl.addWidget(QLabel("中心频率 (GHz):", styleSheet="font-size:9pt;"))
+        self.e_fc = QLineEdit("39"); self.e_fc.setFixedWidth(70)
+        self.e_fc.setStyleSheet("QLineEdit{background:#FFF;border:1px solid #C0C8D8;border-radius:3px;padding:2px 6px;font-size:9pt;}")
+        ctrl.addWidget(self.e_fc)
+        ctrl.addWidget(QLabel("带宽 (MHz):", styleSheet="font-size:9pt;"))
+        self.e_bw = QLineEdit("500"); self.e_bw.setFixedWidth(70)
+        self.e_bw.setStyleSheet(self.e_fc.styleSheet())
+        ctrl.addWidget(self.e_bw)
+        btn_draw = QPushButton("绘制")
+        btn_draw.setFixedHeight(26)
+        btn_draw.setStyleSheet("QPushButton{background:#2E6B8A;color:#FFF;border:none;border-radius:3px;padding:0 12px;font-size:9pt;}QPushButton:hover{background:#1E4D66;}")
+        btn_draw.clicked.connect(self._plot)
+        ctrl.addWidget(btn_draw)
+        ctrl.addStretch()
+        btn_save = QPushButton("保存图像")
+        btn_save.setFixedHeight(26)
+        btn_save.setStyleSheet("QPushButton{background:#6B4C2E;color:#FFF;border:none;border-radius:3px;padding:0 12px;font-size:9pt;}QPushButton:hover{background:#4A3420;}")
+        btn_save.clicked.connect(self._save)
+        ctrl.addWidget(btn_save)
+        lv.addLayout(ctrl)
+
+        self.canvas = FigureCanvas(Figure(figsize=(8, 5), dpi=110))
+        self.canvas.figure.patch.set_facecolor("#F4F6F8")
+        self.canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        lv.addWidget(self.canvas)
+
+    def _plot(self):
+        import numpy as np
+        from modules.ionosphere_effects import calc_ionospheric_group_delay
+        try:
+            fc  = float(self.e_fc.text())
+            bw  = float(self.e_bw.text()) / 1e3   # MHz -> GHz
+        except ValueError:
+            return
+        if fc <= 0 or bw <= 0:
+            return
+
+        f_lo  = max(fc - bw/2, 0.1)
+        f_hi  = fc + bw/2
+        f_arr = np.linspace(f_lo, f_hi, 300)
+        t_arr = np.array([calc_ionospheric_group_delay(f, self._N_T)[1]
+                          for f in f_arr])   # ns
+
+        fig = self.canvas.figure
+        fig.clf()
+        fig.set_constrained_layout(True)
+        ax  = fig.add_subplot(111)
+        ax.set_facecolor("#FAFCFF")
+        fig.patch.set_facecolor("#F4F6F8")
+
+        ax.plot(f_arr, t_arr, color="#1D9E75", lw=2.0)
+        ax.axvline(fc, color="#888", lw=1.0, ls="--",
+                   label=f"中心频率 {fc} GHz")
+        ax.axvline(f_lo, color="#BBBBBB", lw=0.8, ls=":", label=f"f_lo={f_lo:.3f} GHz")
+        ax.axvline(f_hi, color="#BBBBBB", lw=0.8, ls=":", label=f"f_hi={f_hi:.3f} GHz")
+
+        # 标注中心频率处的群时延值
+        t_fc = calc_ionospheric_group_delay(fc, self._N_T)[1]
+        ax.annotate(
+            f"t(fc)={t_fc:.4f} ns",
+            xy=(fc, t_fc), xytext=(12, -18),
+            textcoords="offset points",
+            fontsize=9, color="#1D9E75",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#1D9E75", alpha=0.9, lw=0.8),
+            arrowprops=dict(arrowstyle="-", color="#1D9E75", lw=0.8))
+
+        # 差分群时延（带内时延差）
+        delta_t = float(np.max(t_arr) - np.min(t_arr))
+        ax.set_xlabel("频率 (GHz)", fontsize=11)
+        ax.set_ylabel("群时延 (ns)", fontsize=11)
+        ax.set_title(
+            f"电离层群时延  TEC={self._N_T:.1e} el/m²\n"
+            f"fc={fc} GHz  BW={self.e_bw.text()} MHz  Δt={delta_t:.4f} ns",
+            fontsize=10, pad=8)
+        ax.legend(fontsize=8.5, framealpha=0.93, edgecolor="#CCC")
+        ax.grid(True, color="#E4E8EE", lw=0.6)
+        for sp in ax.spines.values():
+            sp.set_color("#CCCCCC"); sp.set_linewidth(0.8)
+        ax.tick_params(labelsize=9.5)
+
+        self.canvas.draw()
+
+    def _save(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存图像", "group_delay.png",
+            "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)")
+        if path:
+            self.canvas.figure.savefig(path, dpi=150, bbox_inches="tight")
+            QMessageBox.information(self, "保存成功", f"已保存：\n{path}")
+
 
 class ChannelTableWidget(QWidget):
 
@@ -537,6 +635,12 @@ class ChannelTableWidget(QWidget):
         self.btn_plot.clicked.connect(self._show_rain_plot)
         tb.addWidget(self.btn_plot)
 
+        self.btn_delay = QPushButton("群时延图像")
+        self.btn_delay.setFixedHeight(28)
+        self.btn_delay.setStyleSheet(self._bstyle("#5B3FA0"))
+        self.btn_delay.clicked.connect(self._show_group_delay)
+        tb.addWidget(self.btn_delay)
+
         self.btn_excel = QPushButton("导出 Excel")
         self.btn_excel.setFixedHeight(28)
         self.btn_excel.setStyleSheet(self._bstyle("#6B4C2E"))
@@ -587,6 +691,7 @@ class ChannelTableWidget(QWidget):
         self.btn_add.setVisible(not self._city_mode)
         self.btn_del.setVisible(not self._city_mode)
         self.btn_plot.setVisible(self._city_mode)
+        self.btn_delay.setVisible(True)   # 两种模式均可用
 
     # ══════════════════════════════════════════════════════
     #  表格构建
@@ -968,6 +1073,29 @@ class ChannelTableWidget(QWidget):
             QMessageBox.information(self, "提示", "请先选择城市")
             return
         dlg = RainPlotDialog(self._last_stats, parent=self)
+        dlg.show()
+
+    def _show_group_delay(self):
+        N_T = 1e17   # 默认 TEC
+        # 从表格读取用户输入的 TEC（如有）
+        for ri, (name, sym, unit, rtype) in enumerate(ROWS):
+            if name == "电子总含量 TEC" and rtype == "input":
+                it = self.table.item(ri, 3)
+                if it and it.text().strip():
+                    try: N_T = float(it.text().strip())
+                    except: pass
+                break
+        # 从表格读取工作频率作为中心频率默认值
+        fc_default = "39"
+        for ri, (name, sym, unit, rtype) in enumerate(ROWS):
+            if name == "工作频率" and rtype == "input":
+                it = self.table.item(ri, 3)
+                if it and it.text().strip():
+                    fc_default = it.text().strip()
+                break
+        dlg = GroupDelayDialog(N_T=N_T, parent=self)
+        dlg.e_fc.setText(fc_default)
+        dlg._plot()
         dlg.show()
 
     # ══════════════════════════════════════════════════════
