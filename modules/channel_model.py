@@ -429,7 +429,7 @@ class RainPlotDialog(QDialog):
 
         handles = [l1, l2,
                    plt.Line2D([0],[0], color="#999", lw=1, ls="--",
-                               label=f"R_0.01={s.R001:.1f} mm/h")]
+                               label=f"R₀.₀₁={s.R001:.1f} mm/h")]
         ax_a.legend(handles=handles, fontsize=9, loc="upper left",
                     framealpha=0.93, edgecolor="#CCC")
         ax_a.set_title(
@@ -452,6 +452,171 @@ class RainPlotDialog(QDialog):
 # ══════════════════════════════════════════════════════════
 #  群时延图对话框
 # ══════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════
+#  雨衰频域图对话框
+#  横轴：频率 (GHz)，纵轴：链路雨衰 A (dB)
+#  输入：中心频率、带宽、降雨强度 R、仰角、雨顶高度
+# ══════════════════════════════════════════════════════════
+
+class RainFreqDialog(QDialog):
+    """
+    雨衰随频率变化曲线。
+    对每个频率点计算：gamma_R(f, R) × L_eff(f, R)。
+    用户可指定：中心频率 fc (GHz)、带宽 BW (MHz)、
+               降雨强度 R (mm/h)、仰角 θ (°)、雨顶高度 H_R (km)。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("雨衰频域图")
+        self.setMinimumSize(680, 530)
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowMinimizeButtonHint |
+            Qt.WindowType.WindowMaximizeButtonHint |
+            Qt.WindowType.WindowCloseButtonHint)
+        self._build_ui()
+
+    def _build_ui(self):
+        lv = QVBoxLayout(self)
+        lv.setContentsMargins(8, 8, 8, 8)
+        lv.setSpacing(6)
+
+        _es = ("QLineEdit{background:#FFF;border:1px solid #C0C8D8;"
+               "border-radius:3px;padding:2px 6px;font-size:9pt;}")
+        _lb = "font-size:9pt;"
+
+        # ── 参数行 ────────────────────────────────────────
+        row1 = QHBoxLayout(); row1.setSpacing(10)
+        row1.addWidget(QLabel("中心频率 (GHz):", styleSheet=_lb))
+        self.e_fc = QLineEdit("39"); self.e_fc.setFixedWidth(65); self.e_fc.setStyleSheet(_es)
+        row1.addWidget(self.e_fc)
+        row1.addWidget(QLabel("带宽 (MHz):", styleSheet=_lb))
+        self.e_bw = QLineEdit("2000"); self.e_bw.setFixedWidth(65); self.e_bw.setStyleSheet(_es)
+        row1.addWidget(self.e_bw)
+        row1.addWidget(QLabel("降雨强度 R (mm/h):", styleSheet=_lb))
+        self.e_R = QLineEdit("30"); self.e_R.setFixedWidth(55); self.e_R.setStyleSheet(_es)
+        row1.addWidget(self.e_R)
+        row1.addStretch()
+        lv.addLayout(row1)
+
+        row2 = QHBoxLayout(); row2.setSpacing(10)
+        row2.addWidget(QLabel("仰角 θ (°):", styleSheet=_lb))
+        self.e_el = QLineEdit("10"); self.e_el.setFixedWidth(50); self.e_el.setStyleSheet(_es)
+        row2.addWidget(self.e_el)
+        row2.addWidget(QLabel("雨顶高度 H_R (km):", styleSheet=_lb))
+        self.e_hr = QLineEdit("4.0"); self.e_hr.setFixedWidth(55); self.e_hr.setStyleSheet(_es)
+        row2.addWidget(self.e_hr)
+        row2.addWidget(QLabel("极化倾角 τ (°):", styleSheet=_lb))
+        self.e_tau = QLineEdit("45"); self.e_tau.setFixedWidth(50); self.e_tau.setStyleSheet(_es)
+        row2.addWidget(self.e_tau)
+        btn_draw = QPushButton("绘制")
+        btn_draw.setFixedHeight(26)
+        btn_draw.setStyleSheet("QPushButton{background:#8A5B2E;color:#FFF;border:none;"
+                                "border-radius:3px;padding:0 12px;font-size:9pt;}"
+                                "QPushButton:hover{background:#5C3D1E;}")
+        btn_draw.clicked.connect(self._plot)
+        row2.addWidget(btn_draw)
+        row2.addStretch()
+        btn_save = QPushButton("保存图像")
+        btn_save.setFixedHeight(26)
+        btn_save.setStyleSheet("QPushButton{background:#2E6B8A;color:#FFF;border:none;"
+                                "border-radius:3px;padding:0 12px;font-size:9pt;}"
+                                "QPushButton:hover{background:#1E4D66;}")
+        btn_save.clicked.connect(self._save)
+        row2.addWidget(btn_save)
+        lv.addLayout(row2)
+
+        self.canvas = FigureCanvas(Figure(figsize=(8, 5), dpi=110))
+        self.canvas.figure.patch.set_facecolor("#F4F6F8")
+        self.canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        lv.addWidget(self.canvas)
+
+    def _plot(self):
+        import numpy as np
+        from modules.rain_attenuation import (
+            calc_specific_attenuation,
+            calc_effective_path_length,
+        )
+        try:
+            fc  = float(self.e_fc.text())
+            bw  = float(self.e_bw.text()) / 1e3   # MHz -> GHz
+            R   = float(self.e_R.text())
+            el  = float(self.e_el.text())
+            hr  = float(self.e_hr.text())
+            tau = float(self.e_tau.text())
+        except ValueError:
+            return
+        if fc <= 0 or bw <= 0 or R <= 0:
+            return
+
+        f_lo  = max(fc - bw/2, 1.0)
+        f_hi  = fc + bw/2
+        f_arr = np.linspace(f_lo, f_hi, 300)
+        A_arr = np.zeros_like(f_arr)
+
+        for i, f in enumerate(f_arr):
+            g_arr, _, _ = calc_specific_attenuation(
+                f, np.array([R]), el, tau)
+            gamma_i = float(g_arr[0])
+            # 用 R 作为 R001，调用用户版本签名（freq_ghz, rain_rate 为 numpy数组）
+            L = calc_effective_path_length(
+                hr, 0.0, el, f, np.array([R]))
+            L_val = float(L[0]) if hasattr(L, "__len__") else float(L)
+            A_arr[i] = gamma_i * L_val
+
+        fig = self.canvas.figure
+        fig.clf()
+        fig.set_constrained_layout(True)
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#FAFCFF")
+        fig.patch.set_facecolor("#F4F6F8")
+
+        ax.plot(f_arr, A_arr, color="#8A5B2E", lw=2.0)
+        ax.axvline(fc, color="#888", lw=1.0, ls="--",
+                   label=f"fc={fc} GHz")
+        ax.axvline(f_lo, color="#BBBBBB", lw=0.8, ls=":",
+                   label=f"f_lo={f_lo:.3f} GHz")
+        ax.axvline(f_hi, color="#BBBBBB", lw=0.8, ls=":",
+                   label=f"f_hi={f_hi:.3f} GHz")
+
+        # 标注中心频率处的雨衰值
+        g_fc, _, _ = calc_specific_attenuation(fc, np.array([R]), el, tau)
+        L_fc = calc_effective_path_length(hr, 0.0, el, fc, np.array([R]))
+        A_fc = float(g_fc[0]) * (float(L_fc[0]) if hasattr(L_fc, "__len__") else float(L_fc))
+        ax.annotate(
+            f"A(fc)={A_fc:.3f} dB",
+            xy=(fc, A_fc), xytext=(12, 10),
+            textcoords="offset points",
+            fontsize=9, color="#8A5B2E",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#8A5B2E", alpha=0.9, lw=0.8),
+            arrowprops=dict(arrowstyle="-", color="#8A5B2E", lw=0.8))
+
+        # 带内雨衰变化量
+        delta_A = float(np.max(A_arr) - np.min(A_arr))
+        ax.set_xlabel("频率 (GHz)", fontsize=11)
+        ax.set_ylabel("链路雨衰 A (dB)", fontsize=11)
+        ax.set_title(
+            f"雨衰随频率变化  R={R} mm/h  θ={el}°  H_R={hr} km  τ={tau}°\n"
+            f"fc={fc} GHz  BW={self.e_bw.text()} MHz  ΔA={delta_A:.3f} dB",
+            fontsize=10, pad=8)
+        ax.legend(fontsize=8.5, framealpha=0.93, edgecolor="#CCC")
+        ax.grid(True, color="#E4E8EE", lw=0.6)
+        for sp in ax.spines.values():
+            sp.set_color("#CCCCCC"); sp.set_linewidth(0.8)
+        ax.tick_params(labelsize=9.5)
+        self.canvas.draw()
+
+    def _save(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存图像", "rain_freq.png",
+            "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)")
+        if path:
+            self.canvas.figure.savefig(path, dpi=150, bbox_inches="tight")
+            QMessageBox.information(self, "保存成功", f"已保存：\n{path}")
+
 
 class GroupDelayDialog(QDialog):
     """
@@ -629,7 +794,7 @@ class ChannelTableWidget(QWidget):
         tb.addWidget(self.btn_del)
 
         # 城市模式按钮（自定义模式时隐藏）
-        self.btn_plot = QPushButton("输出雨衰图像")
+        self.btn_plot = QPushButton("雨衰与去极化图像")
         self.btn_plot.setFixedHeight(28)
         self.btn_plot.setStyleSheet(self._bstyle("#1D6B42"))
         self.btn_plot.clicked.connect(self._show_rain_plot)
@@ -640,6 +805,12 @@ class ChannelTableWidget(QWidget):
         self.btn_delay.setStyleSheet(self._bstyle("#5B3FA0"))
         self.btn_delay.clicked.connect(self._show_group_delay)
         tb.addWidget(self.btn_delay)
+
+        self.btn_rain_freq = QPushButton("雨衰频域图像")
+        self.btn_rain_freq.setFixedHeight(28)
+        self.btn_rain_freq.setStyleSheet(self._bstyle("#8A5B2E"))
+        self.btn_rain_freq.clicked.connect(self._show_rain_freq)
+        tb.addWidget(self.btn_rain_freq)
 
         self.btn_excel = QPushButton("导出 Excel")
         self.btn_excel.setFixedHeight(28)
@@ -691,7 +862,8 @@ class ChannelTableWidget(QWidget):
         self.btn_add.setVisible(not self._city_mode)
         self.btn_del.setVisible(not self._city_mode)
         self.btn_plot.setVisible(self._city_mode)
-        self.btn_delay.setVisible(True)   # 两种模式均可用
+        self.btn_delay.setVisible(True)      # 两种模式均可用
+        self.btn_rain_freq.setVisible(True)   # 两种模式均可用
 
     # ══════════════════════════════════════════════════════
     #  表格构建
@@ -1073,6 +1245,30 @@ class ChannelTableWidget(QWidget):
             QMessageBox.information(self, "提示", "请先选择城市")
             return
         dlg = RainPlotDialog(self._last_stats, parent=self)
+        dlg.show()
+
+    def _show_rain_freq(self):
+        """雨衰频域图像——横轴频率，用户指定中心频率/带宽/降雨强度"""
+        # 从表格读取工作频率作为中心频率默认值
+        fc_default = "39"
+        R_default  = "30"
+        for ri, (name, sym, unit, rtype) in enumerate(ROWS):
+            if name == "工作频率" and rtype == "input":
+                it = self.table.item(ri, 3)
+                if it and it.text().strip():
+                    fc_default = it.text().strip()
+                break
+        # 自定义模式：读第一列的降雨强度
+        for ri, (name, sym, unit, rtype) in enumerate(ROWS):
+            if name == "R" and rtype == "rain_in":
+                it = self.table.item(ri, 3)
+                if it and it.text().strip():
+                    R_default = it.text().strip()
+                break
+        dlg = RainFreqDialog(parent=self)
+        dlg.e_fc.setText(fc_default)
+        dlg.e_R.setText(R_default)
+        dlg._plot()
         dlg.show()
 
     def _show_group_delay(self):
