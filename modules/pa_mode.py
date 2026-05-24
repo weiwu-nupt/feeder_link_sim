@@ -154,7 +154,8 @@ def load_pa_data(mat_path: str) -> PAData:
     import scipy.io as sio
     m = sio.loadmat(mat_path)
     if "results" not in m:
-        raise ValueError("文件中缺少 results 结构体")
+        raise ValueError("文件中缺少 results 结构体，"
+                          "请选择 helperPACharSavedData*MHz.mat 文件")
     r = m["results"][0, 0]
 
     def fld(name):
@@ -442,7 +443,7 @@ def _form_row(form, label, default, hint="", w=140):
 # ══════════════════════════════════════════════════════════
 
 class PAModelDialog(ModuleDialog):
-    TITLE        = "功放"
+    TITLE        = "功放表征"
     ACCENT_COLOR = "#BA7517"
     MIN_WIDTH    = 1040
     MIN_HEIGHT   = 700
@@ -485,9 +486,9 @@ class PAModelDialog(ModuleDialog):
         fl = QHBoxLayout(); fl.setSpacing(6)
         self.e_file = QLineEdit(); self.e_file.setReadOnly(True)
         self.e_file.setStyleSheet(_ES)
-        self.e_file.setPlaceholderText("")
+        self.e_file.setPlaceholderText("helperPACharSavedData100MHz.mat")
         btn_browse = QPushButton("浏览…")
-        btn_browse.setFixedWidth(70); btn_browse.setFixedHeight(28)
+        btn_browse.setFixedWidth(64); btn_browse.setFixedHeight(28)
         btn_browse.setStyleSheet(
             "QPushButton{background:#FFF;color:#444;border:1px solid #CCC;"
             "border-radius:4px;font-size:9pt;}"
@@ -546,6 +547,12 @@ class PAModelDialog(ModuleDialog):
         mf.addRow(ml, self.combo_model)
         mg.layout().addLayout(mf)
 
+        # 记忆多项式参数（中文标签）
+        pf = QFormLayout(); pf.setSpacing(5); pf.setContentsMargins(0, 0, 0, 0)
+        self.e_memlen = _form_row(pf, "记忆长度:", str(self.MEM_LEN), "", 60)
+        self.e_deglen = _form_row(pf, "多项式阶数:", str(self.DEG_LEN), "", 60)
+        mg.layout().addLayout(pf)
+
         self.btn_fit = QPushButton("拟合模型并绘制 Gain 对比")
         self.btn_fit.setFixedHeight(32)
         self.btn_fit.setStyleSheet(
@@ -568,7 +575,7 @@ class PAModelDialog(ModuleDialog):
         lv.addWidget(mg)
 
         # ── ④ 拟合系数 / 导出 ─────────────────────────────
-        cg = _group("④ 拟合系数")
+        cg = _group("④ 拟合系数 fitCoefMatMem")
         self.txt_coef = QPlainTextEdit()
         self.txt_coef.setReadOnly(True)
         self.txt_coef.setFixedHeight(110)
@@ -616,7 +623,7 @@ class PAModelDialog(ModuleDialog):
     def _browse_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "选择功放数据文件", "",
-            "所有文件(*)")
+            "所有文件 (*)")
         if not path:
             return
         try:
@@ -789,8 +796,8 @@ class PAModelDialog(ModuleDialog):
         paOutput = d.output_wave
 
         modType = self._MODELS[self.combo_model.currentIndex()][1]
-        memLen = self.MEM_LEN
-        degLen = self.DEG_LEN
+        memLen = max(1, _i(self.e_memlen.text(), self.MEM_LEN))
+        degLen = max(1, _i(self.e_deglen.text(), self.DEG_LEN))
 
         self.status.setText("拟合记忆多项式系数…")
         QWidget.repaint(self)
@@ -817,7 +824,7 @@ class PAModelDialog(ModuleDialog):
         absC = np.abs(coefMat)
         lines = [f"模型: {modType}   memLen={memLen}  degLen={degLen}",
                  f"系数矩阵维度: {coefMat.shape[0]} × {coefMat.shape[1]}",
-                 "模型系数:"]
+                 "系数:"]
         for row in absC:
             lines.append("  " + "  ".join(f"{v:9.4f}" for v in row))
         lines.append(f"时域 RMS 误差: {rmsErr:.4f} %")
@@ -983,8 +990,8 @@ class PAModelDialog(ModuleDialog):
             modType = self.last_modType
             short = "MP" if modType == "memPoly" else "CM"
             C = self.coef_mat
-            memLen = self.MEM_LEN
-            degLen = self.DEG_LEN
+            memLen = max(1, _i(self.e_memlen.text(), self.MEM_LEN))
+            degLen = max(1, _i(self.e_deglen.text(), self.DEG_LEN))
 
             if path.endswith(".npz"):
                 np.savez(path, fitCoefMatMem=C, modType=modType,
@@ -992,7 +999,7 @@ class PAModelDialog(ModuleDialog):
             else:
                 # CSV / TXT：写参数头 + 复数系数（实部+虚部）
                 with open(path, "w", encoding="utf-8") as f:
-                    f.write(f"# 功放拟合系数导出\n")
+                    f.write(f"# 功放表征拟合系数导出\n")
                     f.write(f"# 模型类型, {short} ({modType})\n")
                     f.write(f"# memLen, {memLen}\n")
                     f.write(f"# degLen, {degLen}\n")
