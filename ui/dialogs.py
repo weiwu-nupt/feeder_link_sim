@@ -4,21 +4,10 @@
 
 from ui.base_dialog import ModuleDialog
 from modules.Link_budget import LinkBudgetDialog
-from modules.pa_mode import PAModelDialog
+from modules.pa_model import PAModelDialog
 from modules.ber_analysis import BERAnalysisDialog
 from modules.channel_model import ChannelModelDialog
-
-
-# ── 器件建模：AD/DA ────────────────────────────────────────
-
-class ADDAModelDialog(ModuleDialog):
-    TITLE = "AD/DA 模型"
-    ACCENT_COLOR = "#BA7517"
-    MIN_WIDTH = 680
-    MIN_HEIGHT = 480
-
-    def build_content(self, layout):
-        pass
+from modules.ad_model import ADDAModelDialog   # AD/DA 转换器建模（实现见 modules/adda_model.py）
 
 
 # ── 器件建模：滤波器 ───────────────────────────────────────
