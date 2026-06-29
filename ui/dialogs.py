@@ -7,32 +7,9 @@ from modules.Link_budget import LinkBudgetDialog
 from modules.pa_model import PAModelDialog
 from modules.ber_analysis import BERAnalysisDialog
 from modules.channel_model import ChannelModelDialog
-from modules.ad_model import ADDAModelDialog   # AD/DA 转换器建模（实现见 modules/adda_model.py）
-
-
-# ── 器件建模：滤波器 ───────────────────────────────────────
-
-class FilterModelDialog(ModuleDialog):
-    TITLE = "滤波器模型"
-    ACCENT_COLOR = "#BA7517"
-    MIN_WIDTH = 720
-    MIN_HEIGHT = 520
-
-    def build_content(self, layout):
-        pass
-
-
-# ── 器件建模：混频器 ───────────────────────────────────────
-
-class MixerModelDialog(ModuleDialog):
-    TITLE = "混频器模型"
-    ACCENT_COLOR = "#BA7517"
-    MIN_WIDTH = 680
-    MIN_HEIGHT = 480
-
-    def build_content(self, layout):
-        pass
-
+from modules.ad_model import ADDAModelDialog   
+from modules.filter_model import FilterModelDialog
+from modules.mixer_model import MixerModelDialog
 
 # ── 单链路仿真 ─────────────────────────────────────────────
 

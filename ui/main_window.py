@@ -11,7 +11,7 @@ from ui.styles import APP_STYLE
 from ui.dialogs import (
     LinkBudgetDialog, ChannelModelDialog,
     PAModelDialog, ADDAModelDialog, FilterModelDialog, MixerModelDialog,
-    SingleLinkSimDialog, MultiLinkSimDialog, BERAnalysisDialog,
+    SingleLinkSimDialog, MultiLinkSimDialog, BERAnalysisDialog
 )
 
 
