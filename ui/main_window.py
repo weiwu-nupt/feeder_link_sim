@@ -79,9 +79,9 @@ class MainWindow(QMainWindow):
         """)
         for label, key, cls in [
             ("功放模型",    "pa",     PAModelDialog),
-            ("AD/DA 模型", "adda",   ADDAModelDialog),
+            ("AD 模型",    "adda",   ADDAModelDialog),
             ("滤波器模型",  "filter", FilterModelDialog),
-            ("混频器模型",  "mixer",  MixerModelDialog),
+            ("混频器模型", "mixer",  MixerModelDialog),
         ]:
             act = QAction(label, dev_menu)
             act.triggered.connect(
