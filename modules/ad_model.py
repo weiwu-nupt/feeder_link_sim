@@ -10,7 +10,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
+    QFileDialog, QComboBox, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QVBoxLayout, QWidget,
 )
@@ -19,9 +19,23 @@ from ui.base_dialog import ModuleDialog
 
 
 _VFS = 2.0                         # 归一化输入范围 [-1, 1]
-_INPUT_AMPLITUDE = 0.9              # 基波幅度，约 -0.915 dBFS
+_INPUT_AMPLITUDE = 1.0              # 基波满量程幅度，对应 0 dBFS
 _ACCENT = "#BA7517"
 _MAX_SPURS = 32
+_DEVICE_PROFILES = {
+    "ADC12DJ3200": {
+        "noise_density_dbfs_hz": -151.8,
+        "sfdr_target_db": 60.0,
+        "sfdr_range": "52～69 dBFS",
+        "description": "NSR = -151.8 dBFS/Hz；3 GHz / 65 536 点时理论频谱底噪约 -105.2 dBFS。",
+    },
+    "EV12DS130": {
+        "noise_density_dbfs_hz": -141.0,
+        "sfdr_target_db": 60.0,
+        "sfdr_range": "53～68 dBFS",
+        "description": "归一化 NSR 采用 -141 dBFS/Hz；3 GHz / 65 536 点时理论频谱底噪约 -94.4 dBFS。",
+    },
+}
 
 
 def _setup_font():
@@ -60,11 +74,13 @@ def blackman_harris(length):
 
 
 def amplitude_spectrum(x, fs):
-    """计算经 Blackman-Harris 窗校正后的单边幅度谱。"""
+    """计算相干采样、矩形窗下的单边幅度谱。
+
+    矩形窗的 FFT bin 宽度为 ``fs / N``，可直接将 NSR (dBFS/Hz) 换算为
+    数据手册式的频谱底噪 (dBFS/bin)。
+    """
     n_samples = len(x)
-    window = blackman_harris(n_samples)
-    coherent_gain = np.mean(window)
-    fft = np.fft.rfft(x * window) / (n_samples * coherent_gain)
+    fft = np.fft.rfft(x) / n_samples
     if len(fft) > 2:
         fft[1:-1] *= 2.0
     elif len(fft) == 2:
@@ -72,14 +88,27 @@ def amplitude_spectrum(x, fs):
     return np.fft.rfftfreq(n_samples, 1.0 / fs), np.abs(fft)
 
 
+def white_noise_from_density(n_samples, fs, density_dbfs_hz, seed=2025):
+    """由 NSR (dBFS/Hz) 生成输入端白噪声，并返回其时域 RMS。"""
+    density_dbfs_hz = float(density_dbfs_hz)
+    if density_dbfs_hz > 0:
+        raise ValueError("NSR 应小于或等于 0 dBFS/Hz。")
+    bin_width_hz = fs / n_samples
+    floor_dbfs = density_dbfs_hz + 10.0 * np.log10(bin_width_hz)
+    # 单边幅度谱中 E{|X[k]|²} = 4σ²/N，因此 σ² = 10^(NSR/10)·fs/4。
+    noise_rms = np.sqrt(10 ** (density_dbfs_hz / 10.0) * fs / 4.0)
+    return np.random.default_rng(seed).normal(0.0, noise_rms, size=n_samples), noise_rms
+
+
 def _nearest_bin(freq, target):
     return int(np.argmin(np.abs(freq - target)))
 
 
-def run_adc_model(n_bits, fs, nfft, f_sig, spur_freqs, spur_dbcs):
-    """运行 ``量化(基波 + 多个零相位杂散)`` 的 ADC 行为模型。
+def run_adc_model(n_bits, fs, nfft, f_sig, spur_freqs, spur_dbfs,
+                  noise_density_dbfs_hz=-151.8):
+    """运行 ``量化(基波 + 杂散 + 白噪声)`` 的 ADC 行为模型。
 
-    所有频率单位均为 Hz。``spur_dbcs`` 相对于基波幅度，且与
+    所有频率单位均为 Hz。``spur_dbfs`` 相对于满量程幅度，且与
     ``spur_freqs`` 一一对应；杂散相位固定为 0。
     """
     n_bits = max(2, int(n_bits))
@@ -87,32 +116,41 @@ def run_adc_model(n_bits, fs, nfft, f_sig, spur_freqs, spur_dbcs):
     nfft = int(nfft)
     f_sig = float(f_sig)
     spur_freqs = np.asarray(spur_freqs, dtype=float)
-    spur_dbcs = np.asarray(spur_dbcs, dtype=float)
+    spur_dbfs = np.asarray(spur_dbfs, dtype=float)
 
     if fs <= 0 or nfft < 256:
         raise ValueError("采样率必须大于 0，FFT 点数不得小于 256。")
     if not 0 < f_sig < fs / 2:
         raise ValueError("基波频率必须位于 0 与 Nyquist 频率之间。")
-    if len(spur_freqs) != len(spur_dbcs) or len(spur_freqs) == 0:
-        raise ValueError("每根杂散都需要一组频率和 dBc 电平。")
+    if len(spur_freqs) != len(spur_dbfs) or len(spur_freqs) == 0:
+        raise ValueError("每根杂散都需要一组频率和 dBFS 电平。")
     if np.any((spur_freqs <= 0) | (spur_freqs >= fs / 2)):
         raise ValueError("所有杂散频率必须位于 0 与 Nyquist 频率之间。")
-    if np.any(spur_dbcs > 0):
-        raise ValueError("杂散电平应小于或等于 0 dBc。")
+    if np.any(spur_dbfs > 0):
+        raise ValueError("杂散电平应小于或等于 0 dBFS。")
 
+    bin_width_hz = fs / nfft
+    # 矩形窗 FFT 为避免频谱泄漏，自动对齐到最接近的相干频点。
+    signal_bin = max(1, int(round(f_sig / bin_width_hz)))
+    f_sig_effective = signal_bin * bin_width_hz
     time = np.arange(nfft) / fs
-    baseband = _INPUT_AMPLITUDE * np.sin(2 * np.pi * f_sig * time)
-    spur_amplitudes = _INPUT_AMPLITUDE * 10 ** (spur_dbcs / 20.0)
+    baseband = _INPUT_AMPLITUDE * np.sin(2 * np.pi * f_sig_effective * time)
+    spur_amplitudes = 10 ** (spur_dbfs / 20.0)
+    spur_bins = np.clip(np.rint(spur_freqs / bin_width_hz).astype(int), 1, nfft // 2 - 1)
+    spur_freqs_effective = spur_bins * bin_width_hz
     spurs = np.sum(
-        spur_amplitudes[:, None] * np.sin(2 * np.pi * spur_freqs[:, None] * time),
+        spur_amplitudes[:, None] * np.sin(2 * np.pi * spur_freqs_effective[:, None] * time),
         axis=0,
     )
-    adc_input = baseband + spurs
+    noise, noise_rms = white_noise_from_density(nfft, fs, noise_density_dbfs_hz)
+    noise_floor_theory_dbfs = float(noise_density_dbfs_hz) + 10.0 * np.log10(bin_width_hz)
+    # ADC 输入：基波 + 确定性杂散 + 可配置的模拟白噪声 n(t)。
+    adc_input = baseband + spurs + noise
     output, lsb, overload_count = quantize(adc_input, n_bits)
 
     freq, amplitude = amplitude_spectrum(output, fs)
     amplitude_dbfs = 20 * np.log10(amplitude + 1e-30)
-    sig_bin = _nearest_bin(freq, f_sig)
+    sig_bin = _nearest_bin(freq, f_sig_effective)
     sig_dbfs = amplitude_dbfs[sig_bin]
 
     # 排除 DC 与基波主瓣，剩余最高谱线即为最大杂散。
@@ -128,7 +166,7 @@ def run_adc_model(n_bits, fs, nfft, f_sig, spur_freqs, spur_dbcs):
     sfdr = sig_dbfs - largest_spur_dbfs
 
     noise_valid = valid.copy()
-    for f_spur in spur_freqs:
+    for f_spur in spur_freqs_effective:
         spur_bin = _nearest_bin(freq, f_spur)
         noise_valid[max(0, spur_bin - 5):spur_bin + 6] = False
     if np.any(noise_valid):
@@ -149,9 +187,14 @@ def run_adc_model(n_bits, fs, nfft, f_sig, spur_freqs, spur_dbcs):
         "fs": fs,
         "nfft": nfft,
         "n_bits": n_bits,
-        "f_sig": f_sig,
-        "spur_freqs": spur_freqs,
-        "spur_dbcs": spur_dbcs,
+        "f_sig": f_sig_effective,
+        "f_sig_requested": f_sig,
+        "spur_freqs": spur_freqs_effective,
+        "spur_dbfs": spur_dbfs,
+        "noise_density_dbfs_hz": float(noise_density_dbfs_hz),
+        "noise_floor_theory_dbfs": noise_floor_theory_dbfs,
+        "bin_width_hz": bin_width_hz,
+        "noise_rms": noise_rms,
         "largest_spur_bin": largest_spur_bin,
         "overload_count": overload_count,
         "metrics": {
@@ -170,7 +213,8 @@ def run_adc_chain(cfg):
     return run_adc_model(
         cfg.get("n_bits", 12), cfg.get("fs", 100e6), cfg.get("nfft", 65536),
         cfg.get("f_sig", 10e6), cfg.get("spur_freqs", [5e6, 20e6, 35e6]),
-        cfg.get("spur_dbcs", [-80.0, -85.0, -90.0]),
+        cfg.get("spur_dbfs", cfg.get("spur_dbcs", [-80.0, -85.0, -90.0])),
+        cfg.get("noise_density_dbfs_hz", -151.8),
     )
 
 
@@ -211,7 +255,7 @@ class PlotCanvas(FigureCanvas):
 class ADDAModelDialog(ModuleDialog):
     """ADC：量化位数和多杂散输入的行为模型界面。"""
 
-    TITLE = "AD 模型"
+    TITLE = "ADC/DAC 模型"
     ACCENT_COLOR = _ACCENT
     MIN_WIDTH = 1050
     MIN_HEIGHT = 700
@@ -233,18 +277,34 @@ class ADDAModelDialog(ModuleDialog):
         left_layout.setContentsMargins(0, 0, 8, 0)
         left_layout.setSpacing(7)
 
-        basic_group = _group("① ADC 与基波")
+        basic_group = _group("① ADC 器件与基波")
         basic_form = QFormLayout()
         basic_form.setSpacing(6)
+        self.cb_device = QComboBox()
+        self.cb_device.addItems(_DEVICE_PROFILES.keys())
+        self.cb_device.setStyleSheet(self._combo_style())
         self.e_bits = self._edit("12")
-        self.e_fs = self._edit("100.0")
+        self.e_fs = self._edit("3000.0")
         self.e_nfft = self._edit("65536")
-        self.e_fsig = self._edit("10.000")
+        self.e_fsig = self._edit("500.000")
+        self.e_noise_density = self._edit("-151.8")
+        self.e_sfdr_target = self._edit("60.0")
+        basic_form.addRow(self._label("器件:"), self.cb_device)
         basic_form.addRow(self._label("量化位数 (bit):"), self.e_bits)
         basic_form.addRow(self._label("采样率 (MHz):"), self.e_fs)
         basic_form.addRow(self._label("FFT 点数:"), self.e_nfft)
         basic_form.addRow(self._label("基波频率 (MHz):"), self.e_fsig)
+        basic_form.addRow(self._label("NSR (dBFS/Hz):"), self.e_noise_density)
+        basic_form.addRow(self._label("目标 SFDR (dBFS):"), self.e_sfdr_target)
         basic_group.layout().addLayout(basic_form)
+        self.device_hint = QLabel()
+        self.device_hint.setWordWrap(True)
+        self.device_hint.setStyleSheet("font-size:8.5pt;color:#777;")
+        basic_group.layout().addWidget(self.device_hint)
+        noise_hint = QLabel("在 ADC 输入端叠加高斯白噪声 n(t)；频谱底噪 = NSR + 10·log10(fs / N)。")
+        noise_hint.setWordWrap(True)
+        noise_hint.setStyleSheet("font-size:8.5pt;color:#777;")
+        basic_group.layout().addWidget(noise_hint)
         left_layout.addWidget(basic_group)
 
         self.spur_group = _group("② 杂散输入")
@@ -261,7 +321,7 @@ class ADDAModelDialog(ModuleDialog):
         self.spur_form = QFormLayout()
         self.spur_form.setSpacing(5)
         self.spur_group.layout().addLayout(self.spur_form)
-        hint = QLabel("每根杂散均为零初相位正弦；dBc 相对于基波幅度。")
+        hint = QLabel("每根杂散均为零初相位正弦，电平以满量程为参考（dBFS）；第 1 根由目标 SFDR 自动设定。")
         hint.setWordWrap(True)
         hint.setStyleSheet("font-size:8.5pt;color:#777;")
         self.spur_group.layout().addWidget(hint)
@@ -306,8 +366,8 @@ class ADDAModelDialog(ModuleDialog):
         splitter.setStretchFactor(1, 1)
         layout.addWidget(splitter, stretch=1)
 
-        self._rebuild_spur_rows()
-        self._run()
+        self.cb_device.currentIndexChanged.connect(self._apply_device_preset)
+        self._apply_device_preset()
 
     @staticmethod
     def _value(text, default):
@@ -329,6 +389,31 @@ class ADDAModelDialog(ModuleDialog):
         label.setStyleSheet(_LABEL_STYLE)
         return label
 
+    @staticmethod
+    def _combo_style():
+        return (
+            "QComboBox{background:#FFF;border:1px solid #D0D0D0;border-radius:3px;"
+            "padding:3px 8px;font-size:10pt;color:#111;}"
+            "QComboBox QAbstractItemView{background:#FFF;color:#111;"
+            "selection-background-color:#FAEEDA;font-size:10pt;}"
+        )
+
+    def _apply_device_preset(self):
+        profile = _DEVICE_PROFILES[self.cb_device.currentText()]
+        self.e_fs.setText("3000.0")
+        self.e_nfft.setText("65536")
+        self.e_fsig.setText("500.000")
+        self.e_noise_density.setText(f"{profile['noise_density_dbfs_hz']:.1f}")
+        self.e_sfdr_target.setText(f"{profile['sfdr_target_db']:.1f}")
+        self.e_spur_count.setText("1")
+        if self._rebuild_spur_rows() and self._spur_edits:
+            self._spur_edits[0][0].setText("1200.000")
+            self._spur_edits[0][1].setText(f"{-profile['sfdr_target_db']:.1f}")
+        self.device_hint.setText(
+            f"规格：{profile['description']}  SFDR 范围：{profile['sfdr_range']}"
+        )
+        self._run()
+
     def _spur_count(self):
         count = int(self._value(self.e_spur_count.text(), 1))
         if not 1 <= count <= _MAX_SPURS:
@@ -346,7 +431,7 @@ class ADDAModelDialog(ModuleDialog):
             item = self.spur_form.takeAt(0)
             if item.widget() is not None:
                 item.widget().deleteLater()
-        defaults = [("5.000", "-80"), ("20.000", "-85"), ("35.000", "-90")]
+        defaults = [("1200.000", "-60"), ("1500.000", "-80"), ("1800.000", "-90")]
         self._spur_edits = []
         for index in range(count):
             freq_default, level_default = (
@@ -362,20 +447,33 @@ class ADDAModelDialog(ModuleDialog):
             row_layout.addWidget(freq)
             row_layout.addWidget(QLabel("MHz"))
             row_layout.addWidget(level)
-            row_layout.addWidget(QLabel("dBc"))
+            row_layout.addWidget(QLabel("dBFS"))
             row_layout.addStretch()
             self.spur_form.addRow(self._label(f"杂散 #{index + 1}:"), row)
             self._spur_edits.append((freq, level))
         return True
 
     def _collect_cfg(self):
+        profile_name = self.cb_device.currentText()
+        profile = _DEVICE_PROFILES[profile_name]
+        target_sfdr = self._value(self.e_sfdr_target.text(), profile["sfdr_target_db"])
+        sfdr_limits = (52.0, 69.0) if profile_name == "1号器件" else (53.0, 68.0)
+        if not sfdr_limits[0] <= target_sfdr <= sfdr_limits[1]:
+            raise ValueError(
+                f"{profile_name} 的目标 SFDR 应在 {sfdr_limits[0]:.0f}～{sfdr_limits[1]:.0f} dBFS 之间。"
+            )
+        spur_dbfs = [self._value(level.text(), -80.0) for _, level in self._spur_edits]
+        spur_dbfs[0] = -target_sfdr
         return {
             "n_bits": max(2, int(self._value(self.e_bits.text(), 12))),
-            "fs": self._value(self.e_fs.text(), 100.0) * 1e6,
+            "fs": self._value(self.e_fs.text(), 3000.0) * 1e6,
             "nfft": max(256, int(self._value(self.e_nfft.text(), 65536))),
-            "f_sig": self._value(self.e_fsig.text(), 10.000) * 1e6,
+            "f_sig": self._value(self.e_fsig.text(), 500.000) * 1e6,
             "spur_freqs": [self._value(freq.text(), 0.0) * 1e6 for freq, _ in self._spur_edits],
-            "spur_dbcs": [self._value(level.text(), -80.0) for _, level in self._spur_edits],
+            "spur_dbfs": spur_dbfs,
+            "noise_density_dbfs_hz": self._value(
+                self.e_noise_density.text(), profile["noise_density_dbfs_hz"]
+            ),
         }
 
     def _run(self):
@@ -383,6 +481,7 @@ class ADDAModelDialog(ModuleDialog):
             if not self._rebuild_spur_rows():
                 return
             result = run_adc_model(**self._collect_cfg())
+            result["device_name"] = self.cb_device.currentText()
             self._last_result = result
             self._plot_spectrum(result)
         except Exception as error:
@@ -403,14 +502,15 @@ class ADDAModelDialog(ModuleDialog):
         ax.axhline(metrics["noise_floor_dbfs"], color="#777777", lw=1.0, ls="--",
                    label="平均噪声底")
         ax.set_xlim(0, result["fs"] / 2e6)
-        lower_limit = min(-300.0, metrics["noise_floor_dbfs"] - 12.0,
+        lower_limit = min(-120.0, metrics["noise_floor_dbfs"] - 12.0,
                           metrics["largest_spur_dbfs"] - 12.0)
         ax.set_ylim(lower_limit, 5)
         ax.set_xlabel("频率 (MHz)", fontsize=10)
         ax.set_ylabel("幅度 (dBFS)", fontsize=10)
         ax.set_title(
-            f"ADC 输出频谱  |  {result['n_bits']}-bit  |  "
-            f"{len(result['spur_freqs'])} 根杂散  |  SFDR {result['metrics']['SFDR']:.1f} dBc",
+            f"{result.get('device_name', 'ADC')} 输出频谱  |  {result['n_bits']}-bit  |  "
+            f"NSR={result['noise_density_dbfs_hz']:.1f} dBFS/Hz  |  "
+            f"SFDR {result['metrics']['SFDR']:.1f} dBFS",
             fontsize=10,
         )
         ax.grid(True, color="#E8E8E8", lw=0.5)
@@ -420,8 +520,10 @@ class ADDAModelDialog(ModuleDialog):
         ax.tick_params(labelsize=9)
         self.canvas.draw()
         self.status.setText(
+            f"FFT bin 宽度 = {result['bin_width_hz']:.3f} Hz  |  "
+            f"理论噪声底 = {result['noise_floor_theory_dbfs']:.2f} dBFS\n"
             f"量化步长 (归一化) = {result['lsb']:.6e}\n"
-            f"SFDR = {metrics['SFDR']:.2f} dBc "
+            f"SFDR = {metrics['SFDR']:.2f} dBFS "
             f"(最大杂散在 {self._format_frequency(metrics['largest_spur_freq'])}, "
             f"{metrics['largest_spur_dbfs']:.2f} dBFS)\n"
             f"估计量化噪声基底 = {metrics['noise_floor_dbfs']:.2f} dBFS"

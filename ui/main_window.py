@@ -79,7 +79,7 @@ class MainWindow(QMainWindow):
         """)
         for label, key, cls in [
             ("功放模型",    "pa",     PAModelDialog),
-            ("AD 模型",    "adda",   ADDAModelDialog),
+            ("ADC/DAC 模型",    "adda",   ADDAModelDialog),
             ("滤波器模型",  "filter", FilterModelDialog),
             ("混频器模型", "mixer",  MixerModelDialog),
         ]:
