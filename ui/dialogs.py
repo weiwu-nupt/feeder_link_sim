@@ -10,6 +10,7 @@ from modules.channel_model import ChannelModelDialog
 from modules.ad_model import ADDAModelDialog   
 from modules.filter_model import FilterModelDialog
 from modules.mixer_model import MixerModelDialog
+from modules.rain_sequence_widget import RainSequenceDialog
 
 # ── 单链路仿真 ─────────────────────────────────────────────
 

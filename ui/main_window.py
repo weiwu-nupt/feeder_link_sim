@@ -11,7 +11,7 @@ from ui.styles import APP_STYLE
 from ui.dialogs import (
     LinkBudgetDialog, ChannelModelDialog,
     PAModelDialog, ADDAModelDialog, FilterModelDialog, MixerModelDialog,
-    SingleLinkSimDialog, MultiLinkSimDialog, BERAnalysisDialog
+    SingleLinkSimDialog, MultiLinkSimDialog, BERAnalysisDialog, RainSequenceDialog
 )
 
 
@@ -99,11 +99,15 @@ class MainWindow(QMainWindow):
         self._plain_btn(tb, "误码率分析", btn_style,
                         lambda: self._open("ber", BERAnalysisDialog))
 
-        # ⑤ 单链路仿真
+        # ⑤ 雨衰序列生成（与误码率分析并列的独立功能页）
+        self._plain_btn(tb, "雨衰序列生成", btn_style,
+                        lambda: self._open("rain_sequence", RainSequenceDialog))
+
+        # ⑥ 单链路仿真
         self._plain_btn(tb, "单链路仿真", btn_style,
                         lambda: self._open("single", SingleLinkSimDialog))
 
-        # ⑤ 多链路仿真
+        # ⑦ 多链路仿真
         self._plain_btn(tb, "多链路仿真", btn_style,
                         lambda: self._open("multi", MultiLinkSimDialog))
 
