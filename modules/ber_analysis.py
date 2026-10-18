@@ -1,574 +1,624 @@
-"""
-误码率分析模块 — BER Analysis
-调制方式: PSK (QPSK, 8PSK), APSK (8/16/32/64/128/256APSK), QAM (16/64/256QAM)
-信道编码: DVB-S2/S2X  LDPC+BCH 级联码
-码长: 16200 / 32400 / 64800 bit
-码率: 1/4, 1/3, 2/5, 1/2, 3/5, 2/3, 3/4, 4/5, 5/6, 8/9, 9/10
+"""误码率分析：与馈电链路平台一致的参数、图表和统计界面。"""
 
-理论BER曲线 = 未编码BER（解析式） + 编码增益估算
-QEF门限参考 DVB-S2 EN 302307 Table 13
-"""
-
-import math
-import numpy as np
-from scipy import special
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-from matplotlib.lines import Line2D
-
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLabel, QComboBox, QPushButton, QGroupBox,
-    QSplitter, QFileDialog, QMessageBox, QSizePolicy,
-    QCheckBox, QScrollArea, QFrame,
-)
+import copy
+import csv
+import json
 from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFormLayout,
+    QGroupBox,
+    QLabel,
+    QPushButton,
+    QComboBox,
+    QSplitter,
+    QScrollArea,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QProgressBar,
+    QFileDialog,
+    QMessageBox,
+    QAbstractItemView,
+)
+from matplotlib import rcParams, font_manager
+from pathlib import Path
 
+font_path = Path("C:/Windows/Fonts/msyh.ttc")
+if font_path.exists():
+    font_manager.fontManager.addfont(str(font_path))
+    rcParams["font.family"] = "Microsoft YaHei"
+rcParams["axes.unicode_minus"] = False
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from ui.base_dialog import ModuleDialog
+from ui.styles import APP_STYLE
+from ui.ber_editors import APSKEditor, CodingEditor, integer, decimal
+from modules.ber_core.catalog import FAMILIES
+from modules.ber_core.session import ProcessSession
 
-
-# ── 字体 ──────────────────────────────────────────────────
-def _setup_font():
-    for n in ["Microsoft YaHei","SimHei","PingFang SC","Noto Sans CJK SC"]:
-        if n in {f.name for f in fm.fontManager.ttflist}:
-            plt.rcParams["font.family"] = n
-            plt.rcParams["axes.unicode_minus"] = False
-            return
-_setup_font()
-
-Q = special.erfc   # Q(x) = erfc(x/sqrt(2)) / 2,  erfc(x) = 2*Q(x*sqrt(2))
-def qfunc(x):
-    return 0.5 * special.erfc(x / math.sqrt(2))
-def qfunc_arr(x):
-    return 0.5 * special.erfc(x / np.sqrt(2))
-
-
-# ══════════════════════════════════════════════════════════
-#  调制配置
-# ══════════════════════════════════════════════════════════
-
-MOD_GROUPS = {
-    "PSK":  ["QPSK", "8PSK"],
-    "APSK": ["8APSK", "16APSK", "32APSK", "64APSK", "128APSK", "256APSK"],
-    "QAM":  ["16QAM", "64QAM", "256QAM"],
-}
-
-MOD_BITS = {
-    "QPSK":2, "8PSK":3,
-    "8APSK":3,"16APSK":4,"32APSK":5,"64APSK":6,"128APSK":7,"256APSK":8,
-    "16QAM":4,"64QAM":6,"256QAM":8,
-}
-
-# ══════════════════════════════════════════════════════════
-#  DVB-S2/S2X 码率定义
-# ══════════════════════════════════════════════════════════
-
-CODE_RATES_ALL = [
-    ("1/4", 0.25), ("1/3", 1/3), ("2/5", 0.4),
-    ("1/2", 0.5),  ("3/5", 0.6), ("2/3", 2/3),
-    ("3/4", 0.75), ("4/5", 0.8), ("5/6", 5/6),
-    ("8/9", 8/9),  ("9/10",0.9),
-]
-
-FECFRAME_SIZES = [16200, 32400, 64800]  # bit
-
-# ══════════════════════════════════════════════════════════
-#  DVB-S2 EN302307 Table 13 QEF 门限（Es/No dB，AWGN）
-#  来源: ETSI EN 302 307-1 Table 13，BER=1e-7
-#  格式: {(调制, 码率字符串): Es/No dB}
-# ══════════════════════════════════════════════════════════
-
-QEF_THRESHOLD = {
-    # QPSK
-    ("QPSK", "1/4"): -2.35, ("QPSK", "1/3"): -1.24, ("QPSK", "2/5"): -0.30,
-    ("QPSK", "1/2"):  1.00, ("QPSK", "3/5"):  2.23, ("QPSK", "2/3"):  3.10,
-    ("QPSK", "3/4"):  4.03, ("QPSK", "4/5"):  4.68, ("QPSK", "5/6"):  5.18,
-    ("QPSK", "8/9"):  6.20, ("QPSK", "9/10"): 6.42,
-    # 8PSK
-    ("8PSK", "3/5"):  5.50, ("8PSK", "2/3"):  6.62, ("8PSK", "3/4"):  7.91,
-    ("8PSK", "5/6"):  9.35, ("8PSK", "8/9"): 10.69, ("8PSK", "9/10"):10.98,
-    # 16APSK
-    ("16APSK","2/3"): 8.97,("16APSK","3/4"):10.21,("16APSK","4/5"):11.03,
-    ("16APSK","5/6"):11.61,("16APSK","8/9"):12.89,("16APSK","9/10"):13.13,
-    # 32APSK
-    ("32APSK","3/4"):12.73,("32APSK","4/5"):13.64,("32APSK","5/6"):14.28,
-    ("32APSK","8/9"):15.69,("32APSK","9/10"):16.05,
-    # 64APSK (DVB-S2X，估算值)
-    ("64APSK","2/3"):14.0,("64APSK","3/4"):15.2,("64APSK","4/5"):16.1,
-    ("64APSK","5/6"):16.8,("64APSK","8/9"):18.2,("64APSK","9/10"):18.7,
-    # 128APSK (DVB-S2X)
-    ("128APSK","3/4"):17.5,("128APSK","5/6"):19.0,("128APSK","8/9"):20.5,
-    ("128APSK","9/10"):21.2,
-    # 256APSK (DVB-S2X)
-    ("256APSK","3/4"):20.0,("256APSK","5/6"):21.5,("256APSK","8/9"):23.2,
-    ("256APSK","9/10"):24.0,
-    # QAM (AWGN，估算值)
-    ("16QAM","1/2"):4.0,("16QAM","2/3"):6.5,("16QAM","3/4"):7.5,
-    ("16QAM","5/6"):8.5,("16QAM","8/9"):9.5,("16QAM","9/10"):10.0,
-    ("64QAM","1/2"):9.5,("64QAM","2/3"):11.5,("64QAM","3/4"):12.5,
-    ("64QAM","5/6"):13.5,("64QAM","8/9"):14.5,("64QAM","9/10"):15.0,
-    ("256QAM","1/2"):15.0,("256QAM","2/3"):17.0,("256QAM","3/4"):18.0,
-    ("256QAM","5/6"):19.0,("256QAM","8/9"):20.0,("256QAM","9/10"):20.5,
-}
-
-
-# ══════════════════════════════════════════════════════════
-#  未编码 BER 解析公式（在 AWGN 信道下）
-#  x 轴: Es/No (dB)
-# ══════════════════════════════════════════════════════════
-
-def _esno_db_to_lin(esno_db):
-    return 10 ** (esno_db / 10.0)
-
-def ber_qpsk(esno_db):
-    """QPSK uncoded BER = Q(sqrt(2*Es/No))"""
-    esno = _esno_db_to_lin(esno_db)
-    return qfunc_arr(np.sqrt(2 * esno))
-
-def ber_mpsk(esno_db, M):
-    """M-PSK 近似BER（Gray编码）≈ erfc(sqrt(Es/No * sin(pi/M)^2 * log2(M))) / log2(M)"""
-    m = np.log2(M)
-    esno = _esno_db_to_lin(esno_db)
-    return (1/m) * special.erfc(np.sqrt(esno * (np.sin(np.pi/M)**2) * m))
-
-def ber_apsk(esno_db, M):
-    """
-    APSK BER 近似（基于等效 AWGN SNR + 星座点间距）
-    使用 APSK 的 SER 上界近似，再转换为 BER
-    DVB-S2 APSK 采用同心圆结构，近似为等效 MPSK
-    """
-    m = np.log2(M)
-    esno = _esno_db_to_lin(esno_db)
-    # APSK 近似：外圆的点间距比 MPSK 大，用修正因子
-    # 参考：APSK 编码增益约比等阶 QAM 好 0.5-1dB（卫星非线性信道）
-    if M <= 8:
-        factor = 0.85   # 8APSK 约等于 8PSK
-        return (1/m) * special.erfc(np.sqrt(esno * factor * np.sin(np.pi/M)**2 * m))
-    elif M == 16:
-        # 16APSK(4+12): 内圆4点 + 外圆12点
-        r1 = 1.0; r2 = 2.57   # 典型码率3/4的环比
-        # SER 近似
-        ser = (4/M) * qfunc_arr(np.sqrt(esno) * r1 * np.sqrt(2/(r1**2 + r2**2)) * np.sin(np.pi/4)) + \
-              (12/M) * qfunc_arr(np.sqrt(esno) * r2 * np.sqrt(2/(r1**2 + r2**2)) * np.sin(np.pi/12))
-        return np.clip(ser / m, 0, 0.5)
-    else:
-        # 高阶 APSK 用 Gray 编码 MQAM 近似
-        return ber_mqam(esno_db, M)
-
-def ber_mqam(esno_db, M):
-    """M-QAM BER（Gray编码，矩形星座）
-    BER ≈ (4/log2(M)) * (1 - 1/sqrt(M)) * Q(sqrt(3*log2(M)*Es/No / (M-1)))
-    """
-    m = np.log2(M)
-    esno = _esno_db_to_lin(esno_db)
-    return (4/m) * (1 - 1/np.sqrt(M)) * qfunc_arr(np.sqrt(3 * m * esno / (M - 1)))
-
-def uncoded_ber(mod: str, esno_db_arr: np.ndarray) -> np.ndarray:
-    """根据调制方式计算未编码 BER"""
-    if mod == "QPSK":
-        return ber_qpsk(esno_db_arr)
-    elif mod == "8PSK":
-        return ber_mpsk(esno_db_arr, 8)
-    elif mod.endswith("APSK"):
-        M = int(mod.replace("APSK",""))
-        return ber_apsk(esno_db_arr, M)
-    elif mod.endswith("QAM"):
-        M = int(mod.replace("QAM",""))
-        return ber_mqam(esno_db_arr, M)
-    return np.full_like(esno_db_arr, 0.5)
-
-
-# ══════════════════════════════════════════════════════════
-#  编码 BER 曲线（基于 QEF 门限 + 瀑布曲线近似）
-#
-#  DVB-S2 LDPC+BCH 编码后的 BER 曲线形状：
-#  - 在 QEF 门限以下：BER ≈ 1 - 缓慢改善（误差平台）
-#  - 在 QEF 门限附近：陡峭瀑布（waterfall）下降
-#  - 在 QEF 门限以上：BER < 1e-7（QEF）
-#
-#  近似方法：
-#  1. 瀑布段用 Sigmoid 函数近似（斜率由码长决定）
-#  2. 误差平台区域（error floor）：高码率较低，低码率较高
-# ══════════════════════════════════════════════════════════
-
-def coded_ber(mod: str, code_rate_str: str, fecframe: int,
-              esno_db_arr: np.ndarray) -> np.ndarray:
-    """
-    近似编码后BER曲线。
-
-    瀑布段近似：BER ≈ BER_floor + (0.5 - BER_floor) / (1 + exp(k*(Es/No - Es/No_qef)))
-    k 越大曲线越陡（码长越长越陡），码长64800比16200约陡1.5倍
-    """
-    key = (mod, code_rate_str)
-    if key not in QEF_THRESHOLD:
-        return np.full_like(esno_db_arr, np.nan)
-
-    esno_qef = QEF_THRESHOLD[key]
-
-    # 码长决定瀑布斜率（估算值）
-    slope_map = {16200: 2.5, 32400: 3.2, 64800: 4.0}
-    k = slope_map.get(fecframe, 3.0)
-
-    # 误差平台（error floor）：极高 Es/No 下的剩余 BER
-    # 实际测量约 1e-8 到 1e-10，这里取 1e-8 做保守估计
-    ber_floor = 1e-8
-
-    # BER_uncoded（用于瀑布顶部水平）
-    ber_top = uncoded_ber(mod, np.array([esno_qef - 3.0]))[0]
-    ber_top = min(ber_top, 0.3)
-
-    # Sigmoid 瀑布
-    ber = np.zeros_like(esno_db_arr)
-    for i, esno in enumerate(esno_db_arr):
-        if esno < esno_qef - 5:
-            # 远低于门限：近似为未编码BER（稍有改善）
-            ber[i] = min(uncoded_ber(mod, np.array([esno]))[0], 0.5)
-        elif esno > esno_qef + 3:
-            # 远高于门限：QEF（取 error floor）
-            ber[i] = ber_floor
-        else:
-            # 瀑布段：Sigmoid
-            sigmoid = 1.0 / (1.0 + math.exp(k * (esno - esno_qef)))
-            ber[i] = max(ber_floor, ber_top * sigmoid + ber_floor * (1 - sigmoid))
-
-    return ber
-
-
-# ══════════════════════════════════════════════════════════
-#  有效信息 BER（信息比特误码率）
-#  BER_info = BER_coded / R   （R = 码率）
-# ══════════════════════════════════════════════════════════
-
-def info_ber(mod, code_rate_str, fecframe, esno_db_arr):
-    rate = dict(CODE_RATES_ALL).get(code_rate_str, 0.5)
-    ber = coded_ber(mod, code_rate_str, fecframe, esno_db_arr)
-    return ber  # 已是比特误码率，不需要除以码率
-
-
-# ══════════════════════════════════════════════════════════
-#  UI 辅助
-# ══════════════════════════════════════════════════════════
-
-_ES = ("QLineEdit{background:#FFF;border:1px solid #D0D0D0;"
-       "border-radius:3px;padding:3px 6px;font-size:10pt;color:#111;}"
-       "QLineEdit:focus{border:1.5px solid #1D9E75;}")
-_LS = "font-size:10pt;color:#2C2C2A;"
-_GB = ("QGroupBox{background:#FFF;border:1px solid #E0E0E0;"
-       "border-radius:6px;margin-top:8px;padding:6px 8px;}"
-       "QGroupBox::title{subcontrol-origin:margin;left:10px;"
-       "padding:0 4px;color:#1D9E75;font-size:9pt;font-weight:bold;}")
-
-def _group(t):
-    gb = QGroupBox(t); gb.setStyleSheet(_GB)
-    vl = QVBoxLayout(gb); vl.setSpacing(4); vl.setContentsMargins(6,4,6,6)
-    return gb
-
-_COLORS = [
-    "#0055CC","#CC2200","#1D9E75","#BA7517","#7B3FA0",
-    "#00838F","#C62828","#37474F","#2E7D32","#6A1B9A",
-    "#E65100","#0277BD","#558B2F","#4527A0","#AD1457",
-]
-
-
-# ══════════════════════════════════════════════════════════
-#  画布
-# ══════════════════════════════════════════════════════════
-
-class PlotCanvas(FigureCanvas):
-    def __init__(self):
-        self.fig = Figure(figsize=(7, 5.5), dpi=96)
-        self.fig.patch.set_facecolor("#F8F8F8")
-        super().__init__(self.fig)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding,
-                           QSizePolicy.Policy.Expanding)
-
-    def save(self, path):
-        self.fig.savefig(path, dpi=150, bbox_inches="tight")
-
-
-# ══════════════════════════════════════════════════════════
-#  对话框
-# ══════════════════════════════════════════════════════════
 
 class BERAnalysisDialog(ModuleDialog):
-    TITLE        = "误码率分析"
-    ACCENT_COLOR = "#1D9E75"
-    MIN_WIDTH    = 1050
-    MIN_HEIGHT   = 680
+    TITLE = "误码率分析"
+    MIN_WIDTH = 1060
+    MIN_HEIGHT = 680
+    ACCENT_COLOR = "#378ADD"
 
-    def build_content(self, layout: QVBoxLayout):
-        layout.setContentsMargins(10, 8, 10, 10)
-        layout.setSpacing(0)
-
-        sp = QSplitter(Qt.Orientation.Horizontal)
-        sp.setHandleWidth(1)
-        sp.setStyleSheet("QSplitter::handle{background:#DDDDDD;}")
-
-        # ══ 左侧配置 ══════════════════════════════════════
+    def build_content(self, layout):
+        self.setStyleSheet(APP_STYLE + """
+            QPushButton:disabled{color:#B4B2A9;background:#FAFAF8;border-color:#E8E8E5;}
+        """)
+        self.codes = []
+        self.runs = []
+        self.active = None
+        self.current_rows = []
+        self.editors = []
+        self.ready = False
+        self.session = ProcessSession(self)
+        self.session.message.connect(self.handle_event)
+        self.session.ended.connect(self.finished_run)
+        layout.setSpacing(12)
+        toolbar = QHBoxLayout()
+        heading = QLabel("误码率分析")
+        heading.setStyleSheet("font-size:14pt;font-weight:600;color:#2C2C2A;")
+        toolbar.addWidget(heading)
+        description = QLabel("调制编码 · AWGN 信道")
+        description.setStyleSheet("color:#888780;")
+        toolbar.addWidget(description)
+        toolbar.addStretch()
+        self.export_button = QPushButton("导出数据")
+        self.image_button = QPushButton("导出曲线")
+        self.clear_button = QPushButton("清空结果")
+        for button in (self.export_button, self.image_button, self.clear_button):
+            toolbar.addWidget(button)
+        self.export_button.clicked.connect(self.export_data)
+        self.image_button.clicked.connect(self.export_image)
+        self.clear_button.clicked.connect(self.clear_results)
+        layout.addLayout(toolbar)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(1)
+        splitter.setStyleSheet("QSplitter::handle{background:#E8E8E5;}")
+        layout.addWidget(splitter, 1)
         left = QWidget()
-        left.setMinimumWidth(280); left.setMaximumWidth(350)
+        left.setObjectName("berParameterContent")
         lv = QVBoxLayout(left)
-        lv.setContentsMargins(0,0,8,0); lv.setSpacing(7)
-
-        # ── SNR 范围 ──────────────────────────────────────
-        sg = _group("信噪比范围 (Es/No)")
-        sf = QFormLayout(); sf.setSpacing(5); sf.setContentsMargins(0,0,0,0)
-        sg.layout().addLayout(sf)
-
-        self._snr_min = self._lineedit("-5")
-        self._snr_max = self._lineedit("25")
-        self._snr_pts = self._lineedit("200")
-        sf.addRow(self._label("起始 (dB):"), self._snr_min)
-        sf.addRow(self._label("终止 (dB):"), self._snr_max)
-        sf.addRow(self._label("点数:"),      self._snr_pts)
-        lv.addWidget(sg)
-
-        # ── 调制方式 ──────────────────────────────────────
-        mg = _group("调制方式")
-        mf = QFormLayout(); mf.setSpacing(5); mf.setContentsMargins(0,0,0,0)
-        mg.layout().addLayout(mf)
-
-        self._mod_type = QComboBox()
-        self._mod_type.setStyleSheet(self._cb_style())
-        self._mod_type.addItems(["PSK", "APSK", "QAM"])
-        self._mod_type.currentTextChanged.connect(self._on_mod_type_changed)
-        mf.addRow(self._label("类型:"), self._mod_type)
-
-        self._mod_order = QComboBox()
-        self._mod_order.setStyleSheet(self._cb_style())
-        mf.addRow(self._label("阶数:"), self._mod_order)
-
-        # 未编码 BER 开关
-        self._uncoded_cb = QCheckBox("显示未编码 BER")
-        self._uncoded_cb.setStyleSheet("font-size:10pt;color:#444;")
-        self._uncoded_cb.setChecked(True)
-        mg.layout().addWidget(self._uncoded_cb)
-        lv.addWidget(mg)
-
-        # ── 信道编码 ──────────────────────────────────────
-        cg = _group("信道编码（LDPC+BCH）")
-        cg_note = QLabel(
-            "DVB-S2/S2X 级联码\n"
-            "外码: BCH   内码: LDPC\n"
-            "可选多条曲线同时显示")
-        cg_note.setStyleSheet("font-size:8pt;color:#666;")
-        cg_note.setWordWrap(True)
-        cg.layout().addWidget(cg_note)
-
-        # 码长选择
-        cf = QFormLayout(); cf.setSpacing(5); cf.setContentsMargins(0,0,0,0)
-        cg.layout().addLayout(cf)
-        self._fecframe = QComboBox()
-        self._fecframe.setStyleSheet(self._cb_style())
-        self._fecframe.addItems(["64800 (Normal)", "32400 (Medium)", "16200 (Short)"])
-        cf.addRow(self._label("码长 (bit):"), self._fecframe)
-        lv.addWidget(cg)
-
-        # 码率多选
-        rg = _group("码率（可多选）")
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(180)
-        scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
-        inner = QWidget(); inner_lv = QVBoxLayout(inner)
-        inner_lv.setSpacing(2); inner_lv.setContentsMargins(2,2,2,2)
-        self._rate_cbs = {}
-        for name, val in CODE_RATES_ALL:
-            cb = QCheckBox(name)
-            cb.setStyleSheet("font-size:10pt;color:#333;")
-            # 默认勾选常用码率
-            cb.setChecked(name in ("1/2","2/3","3/4","5/6","8/9"))
-            self._rate_cbs[name] = cb
-            inner_lv.addWidget(cb)
-        inner_lv.addStretch()
-        scroll.setWidget(inner)
-        rg.layout().addWidget(scroll)
-
-        # 全选/全不选
-        sel_hl = QHBoxLayout(); sel_hl.setSpacing(6)
-        btn_all = QPushButton("全选"); btn_all.setFixedHeight(24)
-        btn_all.setStyleSheet("QPushButton{font-size:9pt;padding:0 8px;"
-                               "border:1px solid #CCC;border-radius:3px;background:#F5F5F5;}"
-                               "QPushButton:hover{background:#E8E8E8;}")
-        btn_none = QPushButton("全不选"); btn_none.setFixedHeight(24)
-        btn_none.setStyleSheet(btn_all.styleSheet())
-        btn_all.clicked.connect(lambda: [cb.setChecked(True) for cb in self._rate_cbs.values()])
-        btn_none.clicked.connect(lambda: [cb.setChecked(False) for cb in self._rate_cbs.values()])
-        sel_hl.addWidget(btn_all); sel_hl.addWidget(btn_none); sel_hl.addStretch()
-        rg.layout().addLayout(sel_hl)
-        lv.addWidget(rg)
-
-        # ── 按钮 ──────────────────────────────────────────
-        bhl = QHBoxLayout(); bhl.setSpacing(8); bhl.setContentsMargins(0,4,0,0)
-        self.btn_run = QPushButton("绘制 BER 曲线")
-        self.btn_run.setFixedHeight(32)
-        self.btn_run.setStyleSheet(
-            "QPushButton{background:#1D9E75;color:#FFF;border:none;"
-            "border-radius:5px;font-size:10pt;font-weight:bold;}"
-            "QPushButton:hover{background:#14705A;}")
-        self.btn_run.clicked.connect(self._run)
-        bhl.addWidget(self.btn_run)
-        self.btn_save = QPushButton("保存图像")
-        self.btn_save.setFixedHeight(32)
-        self.btn_save.setStyleSheet(
-            "QPushButton{background:#FFF;color:#444;border:1px solid #CCC;"
-            "border-radius:5px;font-size:10pt;}"
-            "QPushButton:hover{background:#F5F5F5;}")
-        self.btn_save.clicked.connect(self._save)
-        bhl.addWidget(self.btn_save)
-        lv.addLayout(bhl)
+        lv.setContentsMargins(0, 0, 12, 0)
+        lv.setSpacing(10)
+        scroll = QScrollArea()
+        scroll.setObjectName("berParameterScroll")
+        scroll.viewport().setObjectName("berScrollViewport")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(left)
+        left_panel = QWidget()
+        left_panel.setObjectName("berParameterPanel")
+        left_panel.setMinimumWidth(360)
+        left_panel.setMaximumWidth(450)
+        panel_layout = QVBoxLayout(left_panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.addWidget(scroll, 1)
+        splitter.addWidget(left_panel)
+        modulation = QGroupBox("调制方式")
+        mf = QFormLayout(modulation)
+        self.modulation = QComboBox()
+        mf.addRow("调制配置", self.modulation)
+        actions = QHBoxLayout()
+        self.add_mod = QPushButton("新增 APSK")
+        self.edit_mod = QPushButton("修改")
+        self.del_mod = QPushButton("删除")
+        for button in (self.add_mod, self.edit_mod, self.del_mod):
+            actions.addWidget(button)
+        mf.addRow(actions)
+        lv.addWidget(modulation)
+        coding = QGroupBox("信道编码")
+        cf = QFormLayout(coding)
+        self.family = QComboBox()
+        self.coding = QComboBox()
+        cf.addRow("编码类别", self.family)
+        cf.addRow("编码配置", self.coding)
+        self.code_info = QLabel("正在加载本地编码库…")
+        self.code_info.setWordWrap(True)
+        self.code_info.setStyleSheet("color:#888780;font-size:9pt;")
+        cf.addRow(self.code_info)
+        ca = QHBoxLayout()
+        self.add_code = QPushButton("新增编码")
+        self.edit_code = QPushButton("修改")
+        self.del_code = QPushButton("删除")
+        for button in (self.add_code, self.edit_code, self.del_code):
+            ca.addWidget(button)
+        cf.addRow(ca)
+        self.iterations = integer(20, 1, 200)
+        cf.addRow("译码迭代", self.iterations)
+        lv.addWidget(coding)
+        sweep = QGroupBox("信噪比扫描")
+        sf = QFormLayout(sweep)
+        self.snr_start = decimal(0, -30, 60, 0.5)
+        self.snr_stop = decimal(6, -30, 60, 0.5)
+        self.snr_step = decimal(1, 0.001, 60, 0.1)
+        for label, widget in [
+            ("起始 Eb/N0 (dB)", self.snr_start),
+            ("终止 Eb/N0 (dB)", self.snr_stop),
+            ("步进 (dB)", self.snr_step),
+        ]:
+            sf.addRow(label, widget)
+        lv.addWidget(sweep)
+        limits = QGroupBox("统计与运行")
+        lf = QFormLayout(limits)
+        self.budget = integer(100000, 1, 2000000000)
+        self.error_target = integer(200, 0, 2000000000)
+        self.batch = integer(0, 0, 1024)
+        self.batch.setSpecialValueText("自动")
+        self.device = QComboBox()
+        for label, key in [("自动选择", "auto"), ("CPU", "cpu"), ("CUDA 显卡", "cuda:0")]:
+            self.device.addItem(label, key)
+        for label, widget in [
+            ("每点信息比特上限", self.budget),
+            ("目标错误比特数", self.error_target),
+            ("每批帧数上限", self.batch),
+            ("计算设备", self.device),
+        ]:
+            lf.addRow(label, widget)
+        note = QLabel("错误目标为 0 时仅按比特上限停止。\n按有效信息位统计，末帧补位不计入 BER。")
+        note.setStyleSheet("color:#888780;font-size:9pt;")
+        note.setWordWrap(True)
+        lf.addRow(note)
+        lv.addWidget(limits)
+        for form in (mf, cf, sf, lf):
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        run = QHBoxLayout()
+        self.start_button = QPushButton("开始仿真")
+        self.start_button.setStyleSheet(
+            "QPushButton{background:#378ADD;border-color:#378ADD;color:white;} QPushButton:disabled{background:#D3D1C7;border-color:#D3D1C7;}"
+        )
+        self.stop_button = QPushButton("停止")
+        self.stop_button.setEnabled(False)
+        self.start_button.setEnabled(False)
+        run.addWidget(self.start_button, 1)
+        run.addWidget(self.stop_button)
+        panel_layout.addLayout(run)
         lv.addStretch()
-        sp.addWidget(left)
-
-        # ══ 右侧画布 ══════════════════════════════════════
-        right = QWidget(); rv = QVBoxLayout(right)
-        rv.setContentsMargins(6,0,0,0); rv.setSpacing(4)
-        self.canvas = PlotCanvas()
-        rv.addWidget(self.canvas)
-        self.status = QLabel("就绪 — 选择参数后点击「绘制 BER 曲线」")
-        self.status.setStyleSheet("font-size:9pt;color:#888;")
+        self.start_button.clicked.connect(self.start_run)
+        self.stop_button.clicked.connect(self.stop_run)
+        right = QWidget()
+        right.setObjectName("berResults")
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(12, 0, 0, 0)
+        rv.setSpacing(10)
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(
+            "QTabWidget::pane{border:1px solid #E8E8E5;background:white;border-radius:6px;} QTabBar::tab{padding:9px 18px;color:#5F5E5A;background:#F1EFE8;} QTabBar::tab:selected{background:white;color:#185FA5;}"
+        )
+        self.figure = Figure(facecolor="white", layout="constrained")
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.tabs.addTab(self.canvas, "误码率曲线")
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "仿真配置",
+                "Eb/N0 (dB)",
+                "BER",
+                "FER",
+                "错误比特",
+                "信息比特",
+                "错误帧",
+                "总帧数",
+                "耗时 (s)",
+                "停止原因",
+            ]
+        )
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.tabs.addTab(self.table, "逐点统计")
+        rv.addWidget(self.tabs, 1)
+        curve_note = QLabel("每条曲线仅在首次零误码处显示三角（95% 上界），并与前一点连线。")
+        curve_note.setStyleSheet("color:#888780;font-size:9pt;")
+        rv.addWidget(curve_note)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setStyleSheet(
+            "QProgressBar{border:1px solid #E8E8E5;border-radius:5px;background:white;text-align:center;min-height:18px;} QProgressBar::chunk{background:#B5D4F4;border-radius:4px;}"
+        )
+        rv.addWidget(self.progress)
+        self.status = QLabel("正在读取本地编码配置…")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#5F5E5A;font-size:9pt;")
         rv.addWidget(self.status)
-        sp.addWidget(right)
-        sp.setStretchFactor(0,0); sp.setStretchFactor(1,1)
-        layout.addWidget(sp, stretch=1)
+        self.statistics = QLabel("每个信噪比点独立采样；零误码的统计值保留 BER=0。")
+        self.statistics.setWordWrap(True)
+        self.statistics.setStyleSheet("color:#888780;font-size:9pt;")
+        rv.addWidget(self.statistics)
+        splitter.addWidget(right)
+        splitter.setSizes([390, 1000])
+        self.modulation.currentIndexChanged.connect(self.mod_changed)
+        self.family.currentIndexChanged.connect(self.family_changed)
+        self.coding.currentIndexChanged.connect(self.code_changed)
+        self.add_mod.clicked.connect(lambda: self.open_mod_editor())
+        self.edit_mod.clicked.connect(lambda: self.open_mod_editor(True))
+        self.del_mod.clicked.connect(self.remove_mod)
+        self.add_code.clicked.connect(lambda: self.open_code_editor())
+        self.edit_code.clicked.connect(lambda: self.open_code_editor(True))
+        self.del_code.clicked.connect(self.remove_code)
+        self.draw_curves()
+        try:
+            from modules.ber_core.catalog import load_catalog
 
-        # 初始化调制阶数
-        self._on_mod_type_changed("PSK")
+            self.catalog_loaded(load_catalog())
+        except Exception as error:
+            self.catalog_failed(str(error))
 
-    # ── 调制类型切换 ──────────────────────────────────────
-
-    def _on_mod_type_changed(self, t):
-        self._mod_order.clear()
-        self._mod_order.addItems(MOD_GROUPS.get(t, []))
-
-    # ── 计算并绘图 ────────────────────────────────────────
-
-    def _run(self):
-        try:    self._do_run()
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            QMessageBox.critical(self, "错误", str(e))
-
-    def _do_run(self):
-        try:    snr_min = float(self._snr_min.text())
-        except: snr_min = -5
-        try:    snr_max = float(self._snr_max.text())
-        except: snr_max = 25
-        try:    n_pts = max(50, int(float(self._snr_pts.text())))
-        except: n_pts = 200
-
-        mod = self._mod_order.currentText()
-        if not mod:
-            QMessageBox.information(self, "提示", "请选择调制方式"); return
-
-        fecframe_txt = self._fecframe.currentText()
-        fecframe = int(fecframe_txt.split()[0])
-
-        selected_rates = [name for name, cb in self._rate_cbs.items() if cb.isChecked()]
-        show_uncoded   = self._uncoded_cb.isChecked()
-
-        if not selected_rates and not show_uncoded:
-            QMessageBox.information(self, "提示", "请至少选择一个码率或勾选未编码BER"); return
-
-        esno_arr = np.linspace(snr_min, snr_max, n_pts)
-        self._plot(mod, fecframe, esno_arr, selected_rates, show_uncoded)
-
-    def _plot(self, mod, fecframe, esno_arr, selected_rates, show_uncoded):
-        fig = self.canvas.fig; fig.clf()
-        fig.set_constrained_layout(True)
-        ax = fig.add_subplot(111)
-        ax.set_facecolor("#FFFFFF")
-        fig.patch.set_facecolor("#F8F8F8")
-
-        color_idx = 0
-        plotted = 0
-
-        # 未编码 BER
-        if show_uncoded:
-            ber_u = uncoded_ber(mod, esno_arr)
-            valid = ber_u > 1e-12
-            if valid.any():
-                ax.semilogy(esno_arr[valid], ber_u[valid],
-                            color="#999999", lw=1.5, ls="--",
-                            label=f"{mod} 未编码", zorder=2)
-                plotted += 1
-
-        # 编码 BER（每个选中码率一条曲线）
-        for rate_str in selected_rates:
-            clr = _COLORS[color_idx % len(_COLORS)]
-            color_idx += 1
-            ber_c = coded_ber(mod, rate_str, fecframe, esno_arr)
-            valid = ~np.isnan(ber_c) & (ber_c > 1e-12)
-            if not valid.any():
-                continue
-            ax.semilogy(esno_arr[valid], ber_c[valid],
-                        color=clr, lw=2.0,
-                        label=f"{mod} R={rate_str}", zorder=3)
-            # QEF 门限标注
-            key = (mod, rate_str)
-            if key in QEF_THRESHOLD:
-                qef = QEF_THRESHOLD[key]
-                if snr_arr_has(esno_arr, qef):
-                    ax.axvline(qef, color=clr, lw=0.7, ls=":", alpha=0.6)
-            plotted += 1
-
-        if plotted == 0:
-            self.status.setText("无可用曲线（该调制方式未定义此码率的门限）"); return
-
-        # QEF 参考线
-        ax.axhline(1e-7, color="#CC2200", lw=0.8, ls="-.",
-                   alpha=0.7, label="QEF (BER=10⁻⁷)", zorder=1)
-        ax.axhline(1e-4, color="#FF6600", lw=0.6, ls=":",
-                   alpha=0.5, label="BER=10⁻⁴", zorder=1)
-
-        # 轴设置
-        ax.set_xlabel("Es/No  (dB)", fontsize=10)
-        ax.set_ylabel("BER", fontsize=10)
-        fsize = {64800:"Normal 64800", 32400:"Medium 32400", 16200:"Short 16200"}.get(fecframe,"")
-        ax.set_title(f"{mod}  DVB-S2/S2X  LDPC+BCH  FECFRAME {fsize} bit",
-                     fontsize=10, pad=6)
-        ax.set_xlim(esno_arr[0], esno_arr[-1])
-        ax.set_ylim(1e-9, 1.0)
-        ax.grid(True, which='both', color="#E8E8E8", lw=0.5)
-        ax.grid(True, which='major', color="#D0D0D0", lw=0.8)
-        for sp in ax.spines.values(): sp.set_color("#CCCCCC")
-        ax.tick_params(labelsize=9)
-
-        ax.legend(fontsize=8, framealpha=0.92, edgecolor="#DDDDDD",
-                  loc="upper right", ncol=2 if len(selected_rates)>4 else 1)
-
-        self.canvas.draw()
+    def catalog_loaded(self, catalog):
+        self.codes = catalog["codes"]
+        for mod in catalog["modulations"]:
+            self.modulation.addItem(mod["name"], mod)
+        self.modulation.setCurrentIndex(self.modulation.findText("QPSK"))
+        self.populate_families("dvb")
+        self.ready = True
+        self.start_button.setEnabled(True)
         self.status.setText(
-            f"{mod}  FECFRAME={fecframe}bit  码率={len(selected_rates)}条  "
-            f"Es/No={esno_arr[0]:.0f}~{esno_arr[-1]:.0f}dB")
+            f"就绪 · {sum(c['family']=='dvb' for c in self.codes)} 份 DVB-S2 矩阵 · {sum(c['family']=='nr' for c in self.codes)} 项 NR 配置"
+        )
+        self.mod_changed()
 
-    def _save(self):
+    def catalog_failed(self, message):
+        self.status.setText("编码库加载失败：" + message)
+
+    def populate_families(self, preferred=None):
+        selected = preferred or self.family.currentData()
+        self.family.blockSignals(True)
+        self.family.clear()
+        for key, label in FAMILIES.items():
+            if any(c["family"] == key for c in self.codes):
+                self.family.addItem(label, key)
+        index = self.family.findData(selected)
+        self.family.setCurrentIndex(index if index >= 0 else 0)
+        self.family.blockSignals(False)
+        self.family_changed()
+
+    def family_changed(self):
+        self.coding.blockSignals(True)
+        self.coding.clear()
+        for code in self.codes:
+            if code["family"] == self.family.currentData():
+                self.coding.addItem(code["name"], code)
+        if self.family.currentData() == "dvb":
+            for i in range(self.coding.count()):
+                code = self.coding.itemData(i)
+                if code.get("rate") == "1/2" and "short" in code["id"]:
+                    self.coding.setCurrentIndex(i)
+                    break
+        self.coding.blockSignals(False)
+        self.code_changed()
+
+    def code_changed(self):
+        code = self.coding.currentData()
+        if not code:
+            return
+        if "k" in code:
+            text = f"K = {code['k']} bit · N = {code['n']} bit\n实际码率 K/N = {code['k']/code['n']:.6f}"
+        else:
+            text = "实际 K/N 在准备编码器时由矩阵求秩确定。"
+        if code["family"] == "dvb":
+            text += "\n采用矩阵对应的 LDPC 编码，不含 BCH 外码。"
+        self.code_info.setText(text)
+        self.coding.setToolTip(code["name"])
+        custom = code.get("custom", False)
+        self.edit_code.setEnabled(custom)
+        self.del_code.setEnabled(custom)
+        self.coding.setEnabled(code["family"] != "none")
+        self.iterations.setEnabled(code["family"] not in ("none", "conv"))
+        if code["family"] == "turbo":
+            self.iterations.setValue(6)
+
+    def mod_changed(self):
+        mod = self.modulation.currentData()
+        custom = bool(mod and mod.get("custom"))
+        self.edit_mod.setEnabled(custom)
+        self.del_mod.setEnabled(custom)
+        if mod:
+            self.modulation.setToolTip(mod["name"])
+
+    def open_mod_editor(self, edit=False):
+        original = copy.deepcopy(self.modulation.currentData()) if edit else None
+        dialog = APSKEditor(self, original)
+
+        def save(mod):
+            mod["custom"] = True
+            if edit:
+                self.modulation.setItemText(self.modulation.currentIndex(), mod["name"])
+                self.modulation.setItemData(self.modulation.currentIndex(), mod)
+            else:
+                self.modulation.addItem(mod["name"], mod)
+                self.modulation.setCurrentIndex(self.modulation.count() - 1)
+            self.mod_changed()
+
+        dialog.saved.connect(save)
+        self.editors.append(dialog)
+        dialog.showMaximized()
+
+    def remove_mod(self):
+        if self.modulation.currentData().get("custom"):
+            self.modulation.removeItem(self.modulation.currentIndex())
+
+    def open_code_editor(self, edit=False):
+        original = copy.deepcopy(self.coding.currentData()) if edit else None
+        dialog = CodingEditor(self, original)
+
+        def save(code):
+            if original:
+                self.codes = [c for c in self.codes if c["id"] != original["id"]]
+            if not any(c["id"] == code["id"] for c in self.codes):
+                self.codes.append(code)
+            self.populate_families(code["family"])
+            for i in range(self.coding.count()):
+                if self.coding.itemData(i)["id"] == code["id"]:
+                    self.coding.setCurrentIndex(i)
+                    break
+
+        dialog.saved.connect(save)
+        self.editors.append(dialog)
+        dialog.showMaximized()
+
+    def remove_code(self):
+        code = self.coding.currentData()
+        if code and code.get("custom"):
+            self.codes = [c for c in self.codes if c["id"] != code["id"]]
+            self.populate_families()
+
+    def request(self):
+        from modules.ber_core.simulation import snr_grid
+
+        request = dict(
+            mod=copy.deepcopy(self.modulation.currentData()),
+            code=copy.deepcopy(self.coding.currentData()),
+            start=self.snr_start.value(),
+            stop=self.snr_stop.value(),
+            step=self.snr_step.value(),
+            budget=self.budget.value(),
+            errors=self.error_target.value(),
+            iterations=self.iterations.value(),
+            batch=self.batch.value(),
+            device=self.device.currentData(),
+        )
+        snr_grid(request)
+        if request["mod"] is None or request["code"] is None:
+            raise ValueError("请选择有效的调制和编码配置")
+        return request
+
+    def start_run(self):
+        if not self.ready or self.session.process is not None:
+            return
+        try:
+            request = self.request()
+            self.active = dict(
+                request=request,
+                label=f"{request['mod']['name']} / {FAMILIES[request['code']['family']]} · {request['code']['name']}",
+                rows=[],
+            )
+            self.session.start("simulate", request)
+            self.runs.append(self.active)
+            self.set_running(True)
+            self.progress.setValue(0)
+            self.status.setText("正在启动仿真…")
+        except Exception as error:
+            QMessageBox.warning(self, "无法开始仿真", str(error))
+
+    def set_running(self, running):
+        self.start_button.setEnabled(self.ready and not running)
+        self.stop_button.setEnabled(running)
+        for widget in (
+            self.modulation,
+            self.family,
+            self.coding,
+            self.iterations,
+            self.snr_start,
+            self.snr_stop,
+            self.snr_step,
+            self.budget,
+            self.error_target,
+            self.batch,
+            self.device,
+            self.add_mod,
+            self.edit_mod,
+            self.del_mod,
+            self.add_code,
+            self.edit_code,
+            self.del_code,
+            self.clear_button,
+        ):
+            widget.setEnabled(not running)
+        if not running:
+            self.code_changed()
+            self.mod_changed()
+
+    def stop_run(self):
+        self.session.stop()
+        self.stop_button.setEnabled(False)
+        self.status.setText("正在停止，已完成的批次将保留…")
+
+    def handle_event(self, event):
+        kind = event["type"]
+        if kind == "status":
+            self.status.setText(event["message"])
+        elif kind == "progress":
+            completed = event["index"] + min(1, event["bits"] / self.active["request"]["budget"])
+            self.progress.setValue(int(100 * completed / event["points"]))
+            self.statistics.setText(
+                f"Eb/N0 = {event['ebno']:g} dB　信息比特 {event['bits']:,}　错误比特 {event['bit_errors']:,}　错误帧 {event['frame_errors']:,}"
+            )
+        elif kind == "point":
+            self.active["rows"].append(event["row"])
+            self.add_table_row(self.active, event["row"])
+            self.draw_curves()
+        elif kind == "done":
+            self.status.setText(
+                "仿真已停止，已完成统计已保留。" if event["cancelled"] else "仿真完成。"
+            )
+            if not event["cancelled"]:
+                self.progress.setValue(100)
+        elif kind == "error":
+            self.status.setText("仿真失败：" + event["message"])
+            self.status.setToolTip(event.get("detail", event["message"]))
+
+    def finished_run(self):
+        self.set_running(False)
+
+    def add_table_row(self, run, row):
+        values = [
+            run["label"],
+            f"{row['ebno']:g}",
+            f"{row['ber']:.4g}",
+            f"{row['fer']:.4g}",
+            row["bit_errors"],
+            row["bits"],
+            row["frame_errors"],
+            row["frames"],
+            f"{row['seconds']:.2f}",
+            row["reason"],
+        ]
+        i = self.table.rowCount()
+        self.table.insertRow(i)
+        for j, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            item.setToolTip(str(value))
+            self.table.setItem(i, j, item)
+        self.table.scrollToBottom()
+
+    def draw_curves(self):
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        colors = ["#378ADD", "#1D9E75", "#BA7517", "#7F77DD", "#D85A30"]
+        plotted = False
+        displayed = []
+        for i, run in enumerate(self.runs):
+            rows = run["rows"]
+            if not rows:
+                continue
+            first_zero = next((row for row in rows if row["bit_errors"] == 0), None)
+            rows = [row for row in rows if row["bit_errors"] > 0 or row is first_zero]
+            color = colors[i % len(colors)]
+            plotted = True
+            y = [r["ber"] if r["bit_errors"] else r["upper"] for r in rows]
+            displayed.extend(y)
+            ax.semilogy(
+                [r["ebno"] for r in rows],
+                y,
+                "-",
+                color=color,
+                label=f"{i+1}. {run['label']}",
+            )
+            for zero, marker in ((False, "o"), (True, "v")):
+                points = [r for r in rows if (r["bit_errors"] == 0) == zero]
+                if points:
+                    ax.semilogy(
+                        [r["ebno"] for r in points],
+                        [r["upper"] if zero else r["ber"] for r in points],
+                        marker,
+                        linestyle="None",
+                        color=color,
+                        markerfacecolor="white" if zero else color,
+                        markersize=6 if zero else 4,
+                    )
+        ax.set_yscale("log")
+        lower = min(1e-7, min(displayed) / 2) if displayed else 1e-7
+        ax.set(xlabel="Eb/N0 (dB)", ylabel="BER", ylim=(max(1e-15, lower), 1))
+        if not plotted:
+            ax.set_xlim(
+                self.snr_start.value(), max(self.snr_start.value() + 1, self.snr_stop.value())
+            )
+        ax.grid(True, which="both", alpha=0.15)
+        if plotted:
+            ax.legend(fontsize=8, loc="best")
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "当前结果未观测到误码，详情见逐点统计" if self.runs else "配置参数后开始仿真",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                color="#888780",
+                fontsize=12,
+            )
+        self.canvas.draw_idle()
+
+    def clear_results(self):
+        if self.session.process is not None:
+            return
+        self.runs = []
+        self.active = None
+        self.table.setRowCount(0)
+        self.draw_curves()
+        self.progress.setValue(0)
+        self.status.setText("结果已清空。")
+
+    def export_data(self):
+        if not any(run["rows"] for run in self.runs):
+            QMessageBox.information(self, "导出数据", "暂无可导出的仿真结果。")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出误码统计", "误码率分析.csv", "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(
+                    [
+                        "配置",
+                        "Eb/N0_dB",
+                        "BER",
+                        "FER",
+                        "错误比特",
+                        "有效信息比特",
+                        "错误帧",
+                        "总帧数",
+                        "95%零误码上界",
+                        "耗时_s",
+                        "停止原因",
+                        "参数JSON",
+                    ]
+                )
+                for run in self.runs:
+                    for r in run["rows"]:
+                        writer.writerow(
+                            [
+                                run["label"],
+                                r["ebno"],
+                                r["ber"],
+                                r["fer"],
+                                r["bit_errors"],
+                                r["bits"],
+                                r["frame_errors"],
+                                r["frames"],
+                                r["upper"],
+                                r["seconds"],
+                                r["reason"],
+                                json.dumps(run["request"], ensure_ascii=False),
+                            ]
+                        )
+            self.status.setText("已导出误码统计：" + path)
+        except OSError as error:
+            QMessageBox.warning(self, "导出失败", str(error))
+
+    def export_image(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "保存图像", "BER_Analysis.png",
-            "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)")
+            self, "导出曲线", "误码率曲线.png", "PNG (*.png);;PDF (*.pdf)"
+        )
         if path:
-            self.canvas.save(path)
-            QMessageBox.information(self, "保存成功", f"已保存：\n{path}")
+            try:
+                self.figure.savefig(path, dpi=200)
+            except OSError as error:
+                QMessageBox.warning(self, "导出失败", str(error))
 
-    # ── 辅助 ──────────────────────────────────────────────
-    def _label(self, t):
-        l = QLabel(t); l.setStyleSheet(_LS); return l
-
-    def _lineedit(self, default, w=80):
-        from PyQt6.QtWidgets import QLineEdit
-        e = QLineEdit(default); e.setFixedWidth(w); e.setStyleSheet(_ES)
-        return e
-
-    @staticmethod
-    def _cb_style():
-        return ("QComboBox{background:#FFF;border:1px solid #D0D0D0;"
-                "border-radius:3px;padding:3px 8px;font-size:10pt;color:#111;}"
-                "QComboBox QAbstractItemView{background:#FFF;font-size:10pt;"
-                "color:#111;selection-background-color:#E1F5EE;}")
-
-
-def snr_arr_has(arr, val):
-    return arr[0] <= val <= arr[-1]
+    def closeEvent(self, event):
+        # Matplotlib's deferred timer must not redraw a canvas after its dialog is destroyed.
+        self.canvas._draw_pending = False
+        for editor in self.editors:
+            editor.reject()
+        self.session.dispose()
+        super().closeEvent(event)

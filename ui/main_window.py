@@ -6,8 +6,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction
+from ui.home_workspace import HomeWorkspace
 
-from ui.styles import APP_STYLE
+from ui.styles import APP_STYLE, light_palette
 from ui.dialogs import (
     LinkBudgetDialog, ChannelModelDialog,
     PAModelDialog, ADDAModelDialog, FilterModelDialog, MixerModelDialog,
@@ -19,6 +20,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.setPalette(light_palette())
         self.setWindowTitle("馈电链路仿真平台  v0.1.0")
         self.setMinimumSize(960, 640)
         self.resize(1100, 720)
@@ -58,17 +60,7 @@ class MainWindow(QMainWindow):
             QToolButton::menu-indicator { image: none; }
         """
 
-        # ① 链路预算
-        self._plain_btn(tb, "链路预算", btn_style,
-                        lambda: self._open("link_budget", LinkBudgetDialog))
-
-        # ② 无线信道建模
-        self._plain_btn(tb, "无线信道建模", btn_style,
-                        lambda: self._open("channel", ChannelModelDialog))
-
-        # ③ 器件建模（下拉子菜单，InstantPopup 只响应点击）
-        dev_menu = QMenu()
-        dev_menu.setStyleSheet("""
+        menu_style = """
             QMenu {
                 background:#FFFFFF; border:1px solid #D3D1C7;
                 border-radius:6px; padding:4px;
@@ -76,39 +68,44 @@ class MainWindow(QMainWindow):
             }
             QMenu::item { padding:6px 20px 6px 12px; border-radius:4px; }
             QMenu::item:selected { background:#F1EFE8; }
-        """)
+        """
+
+        # ① 系统设计
+        system_menu = QMenu()
+        system_menu.setStyleSheet(menu_style)
+        for label, key, cls in [
+            ("链路预算", "link_budget", LinkBudgetDialog),
+            ("可用性分析", "availability", ChannelModelDialog),
+            ("雨衰序列生成", "rain_sequence", RainSequenceDialog),
+            ("调制编码优化", "modcod", BERAnalysisDialog),
+        ]:
+            action = QAction(label, system_menu)
+            action.triggered.connect(
+                lambda _=False, k=key, c=cls: self._open(k, c))
+            system_menu.addAction(action)
+        self._menu_btn(tb, "系统设计", btn_style, system_menu)
+
+        # ② 信道建模（当前器件建模能力）
+        channel_menu = QMenu()
+        channel_menu.setStyleSheet(menu_style)
         for label, key, cls in [
             ("功放模型",    "pa",     PAModelDialog),
             ("ADC/DAC 模型",    "adda",   ADDAModelDialog),
             ("滤波器模型",  "filter", FilterModelDialog),
             ("混频器模型", "mixer",  MixerModelDialog),
         ]:
-            act = QAction(label, dev_menu)
+            act = QAction(label, channel_menu)
             act.triggered.connect(
                 lambda _=False, k=key, c=cls: self._open(k, c))
-            dev_menu.addAction(act)
+            channel_menu.addAction(act)
+        self._menu_btn(tb, "信道建模", btn_style, channel_menu)
 
-        dev_btn = QToolButton()
-        dev_btn.setText("器件建模  ▾")
-        dev_btn.setStyleSheet(btn_style)
-        dev_btn.setMenu(dev_menu)
-        dev_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        tb.addWidget(dev_btn)
-
-        # ④ 误码率分析
-        self._plain_btn(tb, "误码率分析", btn_style,
-                        lambda: self._open("ber", BERAnalysisDialog))
-
-        # ⑤ 雨衰序列生成（与误码率分析并列的独立功能页）
-        self._plain_btn(tb, "雨衰序列生成", btn_style,
-                        lambda: self._open("rain_sequence", RainSequenceDialog))
-
-        # ⑥ 单链路仿真
-        self._plain_btn(tb, "单链路仿真", btn_style,
+        # ③ 链路仿真（当前单链路仿真）
+        self._plain_btn(tb, "链路仿真", btn_style,
                         lambda: self._open("single", SingleLinkSimDialog))
 
-        # ⑦ 多链路仿真
-        self._plain_btn(tb, "多链路仿真", btn_style,
+        # ④ 大规模星座仿真（当前多链路仿真）
+        self._plain_btn(tb, "大规模星座仿真", btn_style,
                         lambda: self._open("multi", MultiLinkSimDialog))
 
     @staticmethod
@@ -120,40 +117,20 @@ class MainWindow(QMainWindow):
         btn.clicked.connect(slot)
         tb.addWidget(btn)
 
+    @staticmethod
+    def _menu_btn(tb: QToolBar, label: str, style: str, menu: QMenu):
+        """向工具栏添加点击即展开的一级导航菜单。"""
+        btn = QToolButton()
+        btn.setText(f"{label}  ▼")
+        btn.setStyleSheet(style)
+        btn.setMenu(menu)
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(btn)
+
     # ── 工作区 ────────────────────────────────────────────
 
     def _build_workspace(self):
-        central = QWidget()
-        central.setStyleSheet("background:#F5F5F3;")
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setContentsMargins(40, 40, 40, 40)
-
-        icon_frame = QFrame()
-        icon_frame.setFixedSize(64, 64)
-        icon_frame.setStyleSheet("background:#EEEDFE;border-radius:16px;")
-        ilay = QVBoxLayout(icon_frame)
-        ilay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ilay.addWidget(QLabel("◎",
-            styleSheet="font-size: 20pt;color:#7F77DD;background:transparent;"))
-
-        title = QLabel("馈电链路仿真平台")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-size: 14pt;font-weight:500;color:#444441;")
-
-        subtitle = QLabel("从上方菜单选择模块开始仿真\n"
-                          "链路预算 · 信道建模 · 器件建模 · 单/多链路仿真")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet("font-size: 10pt;color:#888780;")
-
-        layout.addStretch()
-        layout.addWidget(icon_frame, alignment=Qt.AlignmentFlag.AlignCenter)
-        layout.addSpacing(16)
-        layout.addWidget(title)
-        layout.addSpacing(8)
-        layout.addWidget(subtitle)
-        layout.addStretch()
+        self.setCentralWidget(HomeWorkspace(self))
 
     # ── 状态栏 ────────────────────────────────────────────
 
@@ -191,4 +168,4 @@ class MainWindow(QMainWindow):
         dlg = dialog_cls(parent=self)
         dlg.finished.connect(lambda _=None: self._open_dialogs.pop(key, None))
         self._open_dialogs[key] = dlg
-        dlg.show()
+        dlg.showMaximized()

@@ -3,7 +3,51 @@
 Global Stylesheet
 """
 
+
+def light_palette():
+    """Keep unstyled containers and native controls consistent with APP_STYLE."""
+    from PyQt6.QtGui import QColor, QPalette
+
+    palette = QPalette()
+    colors = {
+        QPalette.ColorRole.Window: "#FAFAF8",
+        QPalette.ColorRole.WindowText: "#444441",
+        QPalette.ColorRole.Base: "#FFFFFF",
+        QPalette.ColorRole.AlternateBase: "#FAFAF8",
+        QPalette.ColorRole.Text: "#2C2C2A",
+        QPalette.ColorRole.Button: "#FFFFFF",
+        QPalette.ColorRole.ButtonText: "#444441",
+        QPalette.ColorRole.Highlight: "#B5D4F4",
+        QPalette.ColorRole.HighlightedText: "#2C2C2A",
+        QPalette.ColorRole.ToolTipBase: "#FFFFFF",
+        QPalette.ColorRole.ToolTipText: "#2C2C2A",
+        QPalette.ColorRole.PlaceholderText: "#888780",
+        QPalette.ColorRole.Link: "#378ADD",
+        QPalette.ColorRole.Light: "#FFFFFF",
+        QPalette.ColorRole.Midlight: "#F1EFE8",
+        QPalette.ColorRole.Mid: "#D3D1C7",
+        QPalette.ColorRole.Dark: "#B4B2A9",
+        QPalette.ColorRole.Shadow: "#888780",
+    }
+    for role, color in colors.items():
+        palette.setColor(role, QColor(color))
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText,
+                 QPalette.ColorRole.ButtonText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#888780"))
+    return palette
+
+
 APP_STYLE = """
+/* Parameter containers must keep a light background under a dark system theme. */
+QWidget#berParameterContent, QWidget#berParameterPanel,
+QWidget#berResults, QWidget#berScrollViewport,
+QScrollArea#berParameterScroll,
+QStackedWidget#codingPages, QWidget#codingTrellisPage, QWidget#codingMatrixPage,
+QWidget#codingParameterContent {
+    background-color: #FAFAF8;
+    color: #444441;
+}
+
 QMainWindow {
     background-color: #F5F5F3;
 }
@@ -89,6 +133,7 @@ QLineEdit {
     font-size: 10pt;
     color: #2C2C2A;
     selection-background-color: #B5D4F4;
+    selection-color: #2C2C2A;
 }
 QLineEdit:focus {
     border: 1.5px solid #378ADD;
@@ -96,6 +141,19 @@ QLineEdit:focus {
 }
 QLineEdit:hover {
     border-color: #B4B2A9;
+}
+
+QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit {
+    background-color: #FFFFFF;
+    color: #2C2C2A;
+    border: 1px solid #D3D1C7;
+    border-radius: 6px;
+    padding: 5px 8px;
+    selection-background-color: #B5D4F4;
+    selection-color: #2C2C2A;
+}
+QCheckBox, QRadioButton {
+    color: #444441;
 }
 
 /* ── 按钮 ── */
@@ -162,18 +220,39 @@ QComboBox::drop-down {
     border: none;
     width: 20px;
 }
+QComboBox QFrame {
+    background-color: #FFFFFF;
+    border: 1px solid #D3D1C7;
+}
 QComboBox QAbstractItemView {
     background-color: #FFFFFF;
+    color: #2C2C2A;
     border: 1px solid #D3D1C7;
     border-radius: 6px;
     selection-background-color: #E6F1FB;
     selection-color: #2C2C2A;
     padding: 4px;
+    outline: 0;
+}
+QComboBox QAbstractItemView::item {
+    background-color: #FFFFFF;
+    color: #2C2C2A;
+    min-height: 26px;
+    padding: 3px 8px;
+}
+QComboBox QAbstractItemView::item:selected,
+QComboBox QAbstractItemView::item:hover {
+    background-color: #E6F1FB;
+    color: #2C2C2A;
+}
+QComboBox QAbstractItemView::item:disabled {
+    color: #888780;
 }
 
 /* ── 表格 ── */
 QTableWidget {
     background-color: #FFFFFF;
+    alternate-background-color: #FAFAF8;
     border: 1px solid #E8E8E5;
     border-radius: 6px;
     gridline-color: #F1EFE8;

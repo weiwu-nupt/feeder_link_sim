@@ -12,23 +12,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QFont
 from ui.main_window import MainWindow
+from ui.styles import light_palette
 
 
 def main():
     app = QApplication(sys.argv)
+    app.setPalette(light_palette())
     app.setApplicationName("馈电链路仿真平台")
     app.setApplicationVersion("0.1.0")
 
     # 设置全局默认字体，避免 QFont point size <= 0 警告
-    font = QFont()
+    font = QFont("Microsoft YaHei")
     font.setPointSize(10)
     app.setFont(font)
 
     window = MainWindow()
-    window.show()
+    window.showMaximized()
 
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

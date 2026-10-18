@@ -4,6 +4,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFrame, QSizePolicy, QLabel, QPushButton, QHBoxLayout,
 )
 from PyQt6.QtCore import Qt
+from ui.styles import light_palette
 
 
 class ModuleDialog(QDialog):
@@ -15,6 +16,7 @@ class ModuleDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setPalette(light_palette())
         self.setWindowTitle(self.TITLE)
         self.setMinimumSize(self.MIN_WIDTH, self.MIN_HEIGHT)
         # 独立窗口 + 系统原生最小化/最大化/关闭按钮，非模态
@@ -25,6 +27,7 @@ class ModuleDialog(QDialog):
             | Qt.WindowType.WindowCloseButtonHint
         )
         self.setModal(False)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
         self._build_shell()
 
     def _build_shell(self):
@@ -33,7 +36,8 @@ class ModuleDialog(QDialog):
         root.setSpacing(0)
 
         wrapper = QFrame()
-        wrapper.setStyleSheet("background:#FAFAF8;")
+        wrapper.setObjectName("moduleContent")
+        wrapper.setStyleSheet("QFrame#moduleContent { background:#FAFAF8; }")
         wlay = QVBoxLayout(wrapper)
         wlay.setContentsMargins(16, 16, 16, 16)
         wlay.setSpacing(10)
